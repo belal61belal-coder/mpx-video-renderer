@@ -12,7 +12,7 @@ import httpx
 from bidi.algorithm import get_display
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 ASSETS_DIR = DATA_DIR / "assets"
@@ -23,7 +23,9 @@ LOGO_PATH = Path(os.getenv("LOGO_PATH", "/app/logo.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="MPX Video Renderer", version="2.0.1")
+APP_VERSION = "2.0.4"
+
+app = FastAPI(title="MPX Video Renderer", version=APP_VERSION)
 
 
 def check_api_key(value: str | None) -> None:
@@ -99,12 +101,70 @@ def find_font(bold: bool = False) -> str:
     )
 
 
-def prepare_arabic(text: str) -> str:
-    clean_text = str(text or "").strip()
-    if not clean_text:
-        return ""
-    return get_display(arabic_reshaper.reshape(clean_text))
+def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
+    if features.check_feature("raqm"):
+        return ImageFont.truetype(
+            path,
+            size,
+            layout_engine=ImageFont.Layout.RAQM,
+        )
 
+    return ImageFont.truetype(path, size)
+
+
+def prepare_arabic(text: str) -> str:
+    value = str(text or "").strip()
+
+    if not value:
+        return ""
+
+    if features.check_feature("raqm"):
+        return value
+
+    return get_display(arabic_reshaper.reshape(value))
+
+
+def text_bbox(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int = 0,
+):
+    kwargs = {
+        "font": font,
+        "stroke_width": stroke_width,
+    }
+
+    if features.check_feature("raqm"):
+        kwargs.update(direction="rtl", language="ar")
+
+    return draw.textbbox((0, 0), text, **kwargs)
+
+
+def draw_rtl_text(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int, int],
+    anchor: str = "ra",
+    stroke_width: int = 0,
+    stroke_fill: tuple[int, int, int, int] | None = None,
+) -> None:
+    kwargs = {
+        "font": font,
+        "fill": fill,
+        "anchor": anchor,
+        "stroke_width": stroke_width,
+    }
+
+    if stroke_fill is not None:
+        kwargs["stroke_fill"] = stroke_fill
+
+    if features.check_feature("raqm"):
+        kwargs.update(direction="rtl", language="ar")
+
+    draw.text(position, text, **kwargs)
 
 def wrap_rtl_text(
     text: str,
@@ -123,7 +183,7 @@ def wrap_rtl_text(
     for word in words:
         trial_words = current_line + [word]
         trial_text = prepare_arabic(" ".join(trial_words))
-        bbox = draw.textbbox((0, 0), trial_text, font=font)
+        bbox = text_bbox(draw=draw, text=trial_text, font=font)
         trial_width = bbox[2] - bbox[0]
 
         if trial_width <= max_width:
@@ -159,9 +219,9 @@ def create_design_overlay(
     regular_font_path = find_font(bold=False)
     bold_font_path = find_font(bold=True)
 
-    date_font = ImageFont.truetype(regular_font_path, 34)
-    category_font = ImageFont.truetype(bold_font_path, 34)
-    headline_font = ImageFont.truetype(bold_font_path, 54)
+    date_font = load_font(regular_font_path, 34)
+    category_font = load_font(bold_font_path, 34)
+    headline_font = load_font(bold_font_path, 54)
 
     draw.rectangle((0, 0, width, 7), fill=(230, 183, 40, 255))
 
@@ -212,7 +272,7 @@ def create_design_overlay(
 
     category_value = str(category or "الأخبار").strip()
     category_display = prepare_arabic(category_value)
-    category_bbox = draw.textbbox((0, 0), category_display, font=category_font)
+    category_bbox = text_bbox(draw=draw, text=category_display, font=category_font)
 
     category_width = category_bbox[2] - category_bbox[0]
     category_height = category_bbox[3] - category_bbox[1]
@@ -232,9 +292,10 @@ def create_design_overlay(
         outline=(85, 177, 255, 180),
         width=2,
     )
-    draw.text(
-        (category_right - category_padding_x, category_top + category_padding_y - 3),
-        category_display,
+    draw_rtl_text(
+        draw=draw,
+        position=(category_right - category_padding_x, category_top + category_padding_y - 3),
+        text=category_display,
         font=category_font,
         fill=(255, 255, 255, 255),
         anchor="ra",
@@ -253,18 +314,19 @@ def create_design_overlay(
 
     for line in headline_lines:
         display_line = prepare_arabic(line)
-        draw.text(
-            (width - 55, headline_y),
-            display_line,
+        draw_rtl_text(
+            draw=draw,
+            position=(width - 55, headline_y),
+            text=display_line,
             font=headline_font,
             fill=(255, 255, 255, 255),
             stroke_width=2,
             stroke_fill=(0, 0, 0, 150),
             anchor="ra",
         )
-        line_bbox = draw.textbbox(
-            (0, 0),
-            display_line,
+        line_bbox = text_bbox(
+            draw=draw,
+            text=display_line,
             font=headline_font,
             stroke_width=2,
         )
@@ -320,7 +382,8 @@ def download_file(
 def health() -> dict:
     return {
         "status": "ok",
-        "version": "2.0.1",
+        "version": APP_VERSION,
+        "raqm_enabled": features.check_feature("raqm"),
         "intro_exists": (ASSETS_DIR / "intro.mp4").exists(),
         "outro_exists": (ASSETS_DIR / "outro.mp4").exists(),
         "logo_exists": LOGO_PATH.exists(),
@@ -553,7 +616,8 @@ def render(
 
     return {
         "status": "completed",
-        "version": "2.0.1",
+        "version": APP_VERSION,
+        "raqm_enabled": features.check_feature("raqm"),
         "job_id": job_id,
         "video_url": file_url,
         "file_name": final_path.name,
