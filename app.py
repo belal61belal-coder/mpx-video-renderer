@@ -1,155 +1,1026 @@
-import json, os, re, shutil, subprocess, uuid
+import json
+import os
+import re
+import shutil
+import subprocess
+import uuid
 from pathlib import Path
 from typing import List
+
+import arabic_reshaper
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from bidi.algorithm import get_display
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
+from PIL import Image, ImageDraw, ImageFont
+
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 ASSETS_DIR = DATA_DIR / "assets"
 JOBS_DIR = DATA_DIR / "jobs"
+
 API_KEY = os.getenv("RENDERER_API_KEY", "")
+LOGO_PATH = Path(os.getenv("LOGO_PATH", "/app/logo.png"))
+
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="MPX Video Renderer", version="1.0.0")
+app = FastAPI(
+    title="MPX Video Renderer",
+    version="2.0.0",
+)
 
-def auth(value):
+
+def check_api_key(value: str | None) -> None:
     if not API_KEY:
-        raise HTTPException(500, "RENDERER_API_KEY is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="RENDERER_API_KEY is not configured",
+        )
+
     if value != API_KEY:
-        raise HTTPException(401, "Invalid API key")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+        )
 
-def run(cmd: List[str]):
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode:
-        raise RuntimeError(p.stderr or p.stdout)
 
-def safe_id(value):
-    value = re.sub(r"[^a-z0-9_-]+", "-", str(value or uuid.uuid4()).lower()).strip("-")
+def run(command: List[str]) -> None:
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({result.returncode})\n"
+            f"Command: {' '.join(command)}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+
+
+def safe_job_id(raw_value: str | None) -> str:
+    value = str(raw_value or uuid.uuid4()).lower()
+
+    value = re.sub(
+        r"[^a-z0-9_-]+",
+        "-",
+        value,
+    ).strip("-")
+
     return value[:80] or str(uuid.uuid4())
 
-def duration(path: Path):
-    p = subprocess.run(
-        ["ffprobe","-v","error","-show_entries","format=duration",
-         "-of","default=noprint_wrappers=1:nokey=1",str(path)],
-        capture_output=True, text=True, check=True
-    )
-    return max(float(p.stdout.strip()), 0.1)
 
-def normalize(src: Path, dst: Path, width: int, height: int, fps: int):
-    run([
-        "ffmpeg","-y","-i",str(src),
-        "-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},format=yuv420p",
-        "-c:v","libx264","-preset","veryfast","-crf","20",
-        "-c:a","aac","-ar","48000","-ac","2","-b:a","192k",
-        "-movflags","+faststart",str(dst)
-    ])
+def probe_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    return max(
+        float(result.stdout.strip()),
+        0.1,
+    )
+
+
+def find_font(bold: bool = False) -> str:
+    if bold:
+        candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoKufiArabic-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansArabic-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoKufiArabic-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoKufiArabic-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoKufiArabic-Regular.ttf",
+        ]
+
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+
+    patterns = (
+        "*Arabic*Bold*.ttf"
+        if bold
+        else "*Arabic*Regular*.ttf"
+    )
+
+    for base in [
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+    ]:
+        if base.exists():
+            matches = list(base.rglob(patterns))
+
+            if matches:
+                return str(matches[0])
+
+    fallback = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    )
+
+    return fallback
+
+
+def prepare_arabic(text: str) -> str:
+    clean_text = str(text or "").strip()
+
+    if not clean_text:
+        return ""
+
+    reshaped = arabic_reshaper.reshape(clean_text)
+    return get_display(reshaped)
+
+
+def wrap_rtl_text(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+    draw: ImageDraw.ImageDraw,
+    max_lines: int = 2,
+) -> List[str]:
+    words = str(text or "").split()
+
+    if not words:
+        return []
+
+    lines: List[str] = []
+    current_line: List[str] = []
+
+    for word in words:
+        trial_words = current_line + [word]
+        trial_text = prepare_arabic(" ".join(trial_words))
+
+        bbox = draw.textbbox(
+            (0, 0),
+            trial_text,
+            font=font,
+        )
+
+        trial_width = bbox[2] - bbox[0]
+
+        if trial_width <= max_width:
+            current_line = trial_words
+        else:
+            if current_line:
+                lines.append(
+                    " ".join(current_line)
+                )
+
+            current_line = [word]
+
+            if len(lines) >= max_lines:
+                break
+
+    if current_line and len(lines) < max_lines:
+        lines.append(
+            " ".join(current_line)
+        )
+
+    used_words = sum(
+        len(line.split())
+        for line in lines
+    )
+
+    if used_words < len(words) and lines:
+        last_line = lines[-1].rstrip("،,. ")
+        lines[-1] = last_line + "..."
+
+    return lines[:max_lines]
+
+
+def create_design_overlay(
+    output_path: Path,
+    headline: str,
+    category: str,
+    date_text: str,
+    width: int,
+    height: int,
+) -> None:
+    canvas = Image.new(
+        "RGBA",
+        (width, height),
+        (0, 0, 0, 0),
+    )
+
+    draw = ImageDraw.Draw(canvas)
+
+    regular_font_path = find_font(
+        bold=False
+    )
+    bold_font_path = find_font(
+        bold=True
+    )
+
+    date_font = ImageFont.truetype(
+        regular_font_path,
+        34,
+    )
+
+    category_font = ImageFont.truetype(
+        bold_font_path,
+        34,
+    )
+
+    headline_font = ImageFont.truetype(
+        bold_font_path,
+        54,
+    )
+
+    # خط علوي ذهبي رفيع
+    draw.rectangle(
+        (0, 0, width, 7),
+        fill=(230, 183, 40, 255),
+    )
+
+    # تدرج داكن في الجزء السفلي
+    gradient_height = 570
+    gradient_top = height - gradient_height
+
+    for offset in range(gradient_height):
+        progress = offset / gradient_height
+        alpha = int(
+            35 + (205 * progress)
+        )
+
+        draw.line(
+            (
+                0,
+                gradient_top + offset,
+                width,
+                gradient_top + offset,
+            ),
+            fill=(4, 14, 35, alpha),
+        )
+
+    # التاريخ أعلى اليسار
+    date_value = str(date_text or "").strip()
+
+    if date_value:
+        date_bbox = draw.textbbox(
+            (0, 0),
+            date_value,
+            font=date_font,
+        )
+
+        date_width = (
+            date_bbox[2] - date_bbox[0]
+        )
+        date_height = (
+            date_bbox[3] - date_bbox[1]
+        )
+
+        box_x = 48
+        box_y = 48
+        box_padding_x = 22
+        box_padding_y = 13
+
+        draw.rounded_rectangle(
+            (
+                box_x,
+                box_y,
+                box_x
+                + date_width
+                + box_padding_x * 2,
+                box_y
+                + date_height
+                + box_padding_y * 2,
+            ),
+            radius=18,
+            fill=(4, 19, 50, 205),
+            outline=(230, 183, 40, 150),
+            width=2,
+        )
+
+        draw.text(
+            (
+                box_x + box_padding_x,
+                box_y + box_padding_y - 3,
+            ),
+            date_value,
+            font=date_font,
+            fill=(255, 255, 255, 255),
+        )
+
+    # اللوجو أعلى اليمين
+    if LOGO_PATH.exists():
+        logo = Image.open(
+            LOGO_PATH
+        ).convert("RGBA")
+
+        logo_size = 190
+
+        logo.thumbnail(
+            (logo_size, logo_size),
+            Image.Resampling.LANCZOS,
+        )
+
+        logo_x = (
+            width - logo.width - 42
+        )
+        logo_y = 32
+
+        canvas.alpha_composite(
+            logo,
+            (logo_x, logo_y),
+        )
+
+    # التصنيف
+    category_value = str(
+        category or "الأخبار"
+    ).strip()
+
+    category_display = prepare_arabic(
+        category_value
+    )
+
+    category_bbox = draw.textbbox(
+        (0, 0),
+        category_display,
+        font=category_font,
+    )
+
+    category_width = (
+        category_bbox[2]
+        - category_bbox[0]
+    )
+
+    category_height = (
+        category_bbox[3]
+        - category_bbox[1]
+    )
+
+    category_right = width - 55
+    category_bottom = height - 355
+
+    category_padding_x = 28
+    category_padding_y = 14
+
+    category_box_width = (
+        category_width
+        + category_padding_x * 2
+    )
+
+    category_box_height = (
+        category_height
+        + category_padding_y * 2
+    )
+
+    category_left = (
+        category_right
+        - category_box_width
+    )
+
+    category_top = (
+        category_bottom
+        - category_box_height
+    )
+
+    draw.rounded_rectangle(
+        (
+            category_left,
+            category_top,
+            category_right,
+            category_bottom,
+        ),
+        radius=25,
+        fill=(13, 91, 190, 235),
+        outline=(85, 177, 255, 180),
+        width=2,
+    )
+
+    draw.text(
+        (
+            category_right
+            - category_padding_x,
+            category_top
+            + category_padding_y
+            - 3,
+        ),
+        category_display,
+        font=category_font,
+        fill=(255, 255, 255, 255),
+        anchor="ra",
+    )
+
+    # عنوان الخبر
+    headline_lines = wrap_rtl_text(
+        text=headline,
+        font=headline_font,
+        max_width=width - 110,
+        draw=draw,
+        max_lines=2,
+    )
+
+    headline_y = (
+        category_bottom + 30
+    )
+
+    line_spacing = 22
+
+    for line in headline_lines:
+        display_line = prepare_arabic(
+            line
+        )
+
+        draw.text(
+            (
+                width - 55,
+                headline_y,
+            ),
+            display_line,
+            font=headline_font,
+            fill=(255, 255, 255, 255),
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 150),
+            anchor="ra",
+        )
+
+        line_bbox = draw.textbbox(
+            (0, 0),
+            display_line,
+            font=headline_font,
+            stroke_width=2,
+        )
+
+        headline_y += (
+            line_bbox[3]
+            - line_bbox[1]
+            + line_spacing
+        )
+
+    # خط سفلي ذهبي رفيع
+    draw.rectangle(
+        (
+            0,
+            height - 7,
+            width,
+            height,
+        ),
+        fill=(230, 183, 40, 255),
+    )
+
+    canvas.save(
+        output_path,
+        format="PNG",
+    )
+
+
+def normalize_video(
+    source: Path,
+    target: Path,
+    width: int,
+    height: int,
+    fps: int,
+) -> None:
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            (
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                f"fps={fps},"
+                "format=yuv420p"
+            ),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(target),
+        ]
+    )
+
+
+async def download_file(
+    client: httpx.AsyncClient,
+    url: str,
+    target: Path,
+) -> None:
+    response = await client.get(
+        url,
+        follow_redirects=True,
+        timeout=45,
+    )
+
+    response.raise_for_status()
+    target.write_bytes(response.content)
+
 
 @app.get("/health")
-def health():
+def health() -> dict:
     return {
-        "status":"ok",
-        "intro_exists":(ASSETS_DIR/"intro.mp4").exists(),
-        "outro_exists":(ASSETS_DIR/"outro.mp4").exists()
+        "status": "ok",
+        "version": "2.0.0",
+        "intro_exists": (
+            ASSETS_DIR / "intro.mp4"
+        ).exists(),
+        "outro_exists": (
+            ASSETS_DIR / "outro.mp4"
+        ).exists(),
+        "logo_exists": LOGO_PATH.exists(),
     }
+
 
 @app.post("/assets")
 async def upload_assets(
     intro: UploadFile = File(...),
     outro: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None)
-):
-    auth(x_api_key)
-    for upload, name in [(intro,"intro.mp4"),(outro,"outro.mp4")]:
-        with (ASSETS_DIR/name).open("wb") as f:
-            shutil.copyfileobj(upload.file, f)
-    return {"status":"ok"}
+    x_api_key: str | None = Header(
+        default=None
+    ),
+) -> dict:
+    check_api_key(x_api_key)
+
+    intro_path = (
+        ASSETS_DIR / "intro.mp4"
+    )
+
+    outro_path = (
+        ASSETS_DIR / "outro.mp4"
+    )
+
+    with intro_path.open("wb") as file:
+        shutil.copyfileobj(
+            intro.file,
+            file,
+        )
+
+    with outro_path.open("wb") as file:
+        shutil.copyfileobj(
+            outro.file,
+            file,
+        )
+
+    return {
+        "status": "ok",
+        "intro": str(intro_path),
+        "outro": str(outro_path),
+    }
+
 
 @app.post("/render")
 async def render(
     request: Request,
     payload: str = Form(...),
     audio: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None)
-):
-    auth(x_api_key)
-    try:
-        cfg = json.loads(payload)
-    except json.JSONDecodeError as e:
-        raise HTTPException(400, f"Invalid payload JSON: {e}")
-
-    image_urls = cfg.get("image_urls") or []
-    if not image_urls:
-        raise HTTPException(400, "image_urls must be a non-empty list")
-
-    intro_src, outro_src = ASSETS_DIR/"intro.mp4", ASSETS_DIR/"outro.mp4"
-    if not intro_src.exists() or not outro_src.exists():
-        raise HTTPException(400, "Upload intro.mp4 and outro.mp4 first")
-
-    job_id = safe_id(cfg.get("job_id"))
-    width, height, fps = int(cfg.get("width",1080)), int(cfg.get("height",1920)), int(cfg.get("fps",30))
-    job = JOBS_DIR/job_id
-    if job.exists():
-        shutil.rmtree(job)
-    job.mkdir(parents=True)
-
-    audio_path = job/"narration.mp3"
-    with audio_path.open("wb") as f:
-        shutil.copyfileobj(audio.file, f)
+    x_api_key: str | None = Header(
+        default=None
+    ),
+) -> dict:
+    check_api_key(x_api_key)
 
     try:
-        async with httpx.AsyncClient(headers={"User-Agent":"MPX-Renderer/1.0"}) as client:
-            images = []
-            for i, url in enumerate(image_urls, 1):
-                r = await client.get(str(url), follow_redirects=True, timeout=45)
-                r.raise_for_status()
-                p = job/f"image-{i:02d}.jpg"
-                p.write_bytes(r.content)
-                images.append(p)
+        config = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid payload JSON: {exc}"
+            ),
+        ) from exc
 
-        sec = duration(audio_path) / len(images)
-        clips = []
-        for i, image in enumerate(images, 1):
-            clip = job/f"clip-{i:02d}.mp4"
-            run([
-                "ffmpeg","-y","-loop","1","-t",f"{sec:.3f}","-i",str(image),
-                "-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},format=yuv420p",
-                "-an","-c:v","libx264","-preset","veryfast","-crf","20",str(clip)
-            ])
-            clips.append(clip)
+    image_urls = (
+        config.get("image_urls") or []
+    )
 
-        (job/"clips.txt").write_text("\n".join(f"file '{p.as_posix()}'" for p in clips), encoding="utf-8")
-        run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(job/"clips.txt"),"-c","copy",str(job/"middle-silent.mp4")])
-        run([
-            "ffmpeg","-y","-i",str(job/"middle-silent.mp4"),"-i",str(audio_path),
-            "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-ar","48000","-ac","2","-b:a","192k",
-            "-shortest","-movflags","+faststart",str(job/"middle.mp4")
-        ])
+    if (
+        not isinstance(image_urls, list)
+        or not image_urls
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "image_urls must be "
+                "a non-empty list"
+            ),
+        )
 
-        intro, middle, outro = job/"intro.mp4", job/"middle-normalized.mp4", job/"outro.mp4"
-        normalize(intro_src, intro, width, height, fps)
-        normalize(job/"middle.mp4", middle, width, height, fps)
-        normalize(outro_src, outro, width, height, fps)
+    intro_source = (
+        ASSETS_DIR / "intro.mp4"
+    )
 
-        (job/"final.txt").write_text("\n".join(f"file '{p.as_posix()}'" for p in [intro,middle,outro]), encoding="utf-8")
-        final = job/f"{job_id}-final.mp4"
-        run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(job/"final.txt"),"-c","copy","-movflags","+faststart",str(final)])
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    outro_source = (
+        ASSETS_DIR / "outro.mp4"
+    )
+
+    if (
+        not intro_source.exists()
+        or not outro_source.exists()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Upload intro.mp4 and "
+                "outro.mp4 first"
+            ),
+        )
+
+    job_id = safe_job_id(
+        config.get("job_id")
+    )
+
+    headline = str(
+        config.get("headline") or ""
+    ).strip()
+
+    category = str(
+        config.get("category") or "الأخبار"
+    ).strip()
+
+    date_text = str(
+        config.get("date") or ""
+    ).strip()
+
+    width = int(
+        config.get("width", 1080)
+    )
+
+    height = int(
+        config.get("height", 1920)
+    )
+
+    fps = int(
+        config.get("fps", 30)
+    )
+
+    job_dir = JOBS_DIR / job_id
+
+    if job_dir.exists():
+        shutil.rmtree(job_dir)
+
+    job_dir.mkdir(
+        parents=True
+    )
+
+    audio_path = (
+        job_dir / "narration.mp3"
+    )
+
+    with audio_path.open("wb") as file:
+        shutil.copyfileobj(
+            audio.file,
+            file,
+        )
+
+    overlay_path = (
+        job_dir / "design-overlay.png"
+    )
+
+    create_design_overlay(
+        output_path=overlay_path,
+        headline=headline,
+        category=category,
+        date_text=date_text,
+        width=width,
+        height=height,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            headers={
+                "User-Agent":
+                    "MPX-Video-Renderer/2.0"
+            }
+        ) as client:
+            image_paths: List[Path] = []
+
+            for index, url in enumerate(
+                image_urls,
+                start=1,
+            ):
+                image_path = (
+                    job_dir
+                    / f"image-{index:02d}.jpg"
+                )
+
+                await download_file(
+                    client,
+                    str(url),
+                    image_path,
+                )
+
+                image_paths.append(
+                    image_path
+                )
+
+        audio_duration = probe_duration(
+            audio_path
+        )
+
+        seconds_per_image = (
+            audio_duration
+            / len(image_paths)
+        )
+
+        clip_paths: List[Path] = []
+
+        for index, image_path in enumerate(
+            image_paths,
+            start=1,
+        ):
+            clip_path = (
+                job_dir
+                / f"clip-{index:02d}.mp4"
+            )
+
+            filter_complex = (
+                f"[0:v]"
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                "boxblur=25:12"
+                "[background];"
+                f"[0:v]"
+                f"scale={width - 60}:"
+                f"{height - 60}:"
+                "force_original_aspect_ratio=decrease"
+                "[foreground];"
+                "[background][foreground]"
+                "overlay="
+                "(W-w)/2:"
+                "(H-h)/2"
+                "[base];"
+                "[base][1:v]"
+                "overlay=0:0,"
+                f"fps={fps},"
+                "format=yuv420p"
+            )
+
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loop",
+                    "1",
+                    "-t",
+                    f"{seconds_per_image:.3f}",
+                    "-i",
+                    str(image_path),
+                    "-loop",
+                    "1",
+                    "-i",
+                    str(overlay_path),
+                    "-filter_complex",
+                    filter_complex,
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-shortest",
+                    str(clip_path),
+                ]
+            )
+
+            clip_paths.append(
+                clip_path
+            )
+
+        clips_list = (
+            job_dir / "clips.txt"
+        )
+
+        clips_list.write_text(
+            "\n".join(
+                f"file '{path.as_posix()}'"
+                for path in clip_paths
+            ),
+            encoding="utf-8",
+        )
+
+        middle_silent = (
+            job_dir / "middle-silent.mp4"
+        )
+
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(clips_list),
+                "-c",
+                "copy",
+                str(middle_silent),
+            ]
+        )
+
+        middle = (
+            job_dir / "middle.mp4"
+        )
+
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(middle_silent),
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                str(middle),
+            ]
+        )
+
+        intro = (
+            job_dir
+            / "intro-normalized.mp4"
+        )
+
+        middle_normalized = (
+            job_dir
+            / "middle-normalized.mp4"
+        )
+
+        outro = (
+            job_dir
+            / "outro-normalized.mp4"
+        )
+
+        normalize_video(
+            intro_source,
+            intro,
+            width,
+            height,
+            fps,
+        )
+
+        normalize_video(
+            middle,
+            middle_normalized,
+            width,
+            height,
+            fps,
+        )
+
+        normalize_video(
+            outro_source,
+            outro,
+            width,
+            height,
+            fps,
+        )
+
+        concat_list = (
+            job_dir / "final.txt"
+        )
+
+        concat_list.write_text(
+            "\n".join(
+                f"file '{path.as_posix()}'"
+                for path in [
+                    intro,
+                    middle_normalized,
+                    outro,
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        final_path = (
+            job_dir
+            / f"{job_id}-final.mp4"
+        )
+
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(final_path),
+            ]
+        )
+
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
+
+    file_url = (
+        str(request.base_url).rstrip("/")
+        + f"/files/{job_id}/"
+        + final_path.name
+    )
 
     return {
-        "status":"completed",
-        "job_id":job_id,
-        "video_url":str(request.base_url).rstrip("/") + f"/files/{job_id}/{final.name}",
-        "file_name":final.name,
-        "duration_seconds":duration(final)
+        "status": "completed",
+        "version": "2.0.0",
+        "job_id": job_id,
+        "video_url": file_url,
+        "file_name": final_path.name,
+        "duration_seconds":
+            probe_duration(final_path),
     }
 
-@app.get("/files/{job_id}/{file_name}")
-def get_file(job_id: str, file_name: str, x_api_key: str | None = Header(default=None)):
-    auth(x_api_key)
-    path = JOBS_DIR/safe_id(job_id)/Path(file_name).name
+
+@app.get(
+    "/files/{job_id}/{file_name}"
+)
+def get_file(
+    job_id: str,
+    file_name: str,
+    x_api_key: str | None = Header(
+        default=None
+    ),
+):
+    check_api_key(x_api_key)
+
+    safe_id = safe_job_id(job_id)
+    safe_name = Path(file_name).name
+
+    path = (
+        JOBS_DIR
+        / safe_id
+        / safe_name
+    )
+
     if not path.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+        raise HTTPException(
+            status_code=404,
+            detail="File not found",
+        )
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=safe_name,
+    )
