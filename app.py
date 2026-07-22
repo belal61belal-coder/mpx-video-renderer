@@ -603,7 +603,7 @@ async def upload_assets(
 
 
 @app.post("/render")
-async def render(
+def render(
     request: Request,
     payload: str = Form(...),
     audio: UploadFile = File(...),
@@ -720,7 +720,7 @@ async def render(
     )
 
     try:
-        async with httpx.AsyncClient(
+       with httpx.Client(
             headers={
                 "User-Agent":
                     "MPX-Video-Renderer/2.0"
@@ -737,7 +737,7 @@ async def render(
                     / f"image-{index:02d}.jpg"
                 )
 
-                await download_file(
+                download_file(
                     client,
                     str(url),
                     image_path,
