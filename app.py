@@ -535,12 +535,12 @@ def normalize_video(
     )
 
 
-async def download_file(
-    client: httpx.AsyncClient,
+def download_file(
+    client: httpx.Client,
     url: str,
     target: Path,
 ) -> None:
-    response = await client.get(
+    response = client.get(
         url,
         follow_redirects=True,
         timeout=45,
