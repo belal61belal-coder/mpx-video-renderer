@@ -720,7 +720,7 @@ def render(
     )
 
     try:
-       with httpx.Client(
+        with httpx.Client(
             headers={
                 "User-Agent":
                     "MPX-Video-Renderer/2.0"
