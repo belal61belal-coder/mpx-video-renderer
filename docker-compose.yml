@@ -1,0 +1,16 @@
+services:
+  renderer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATA_DIR: /data
+      RENDERER_API_KEY: ${RENDERER_API_KEY}
+    volumes:
+      - renderer_data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+volumes:
+  renderer_data:
