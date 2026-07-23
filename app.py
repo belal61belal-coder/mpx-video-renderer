@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import List
@@ -25,15 +26,19 @@ TEMPLATE_PATH = Path(os.getenv("TEMPLATE_PATH", "/app/base_template.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "5.0.0"
-SITE_TEXT = "MarketPulseX365.com"
+APP_VERSION = "5.2.0"
+BUILD_NAME = "PHOTO_FILL_AND_PRO_SUBTITLES_CLEAN"
 TRANSITION_SECONDS = 0.35
 
 # Approved coordinates for the new 1080x1920 template.
 BASE_WIDTH = 1080
 BASE_HEIGHT = 1920
-PHOTO_BOX = (46, 436, 1030, 1282)
+# Visible opening inside the gold frame.
+PHOTO_WINDOW_BOX = (45, 435, 1035, 1289)
+# Render the photo slightly larger beneath the frame so no dark gaps can appear.
+PHOTO_RENDER_BOX = (37, 427, 1043, 1297)
 PHOTO_RADIUS = 52
+SUBTITLE_PANEL_BOX = (92, 1065, 988, 1238)
 DATE_TEXT_BOX = (405, 344, 770, 410)
 CATEGORY_TEXT_BOX = (580, 1308, 985, 1368)
 HEADLINE_TEXT_BOX = (78, 1418, 1002, 1692)
@@ -380,211 +385,319 @@ def choose_headline_font(
 
 
 
-def split_narration_chunks(
-    narration: str,
-    max_words: int = 6,
-    min_words: int = 2,
-) -> List[str]:
-    value = re.sub(
-        r"\s+",
-        " ",
-        str(narration or "").strip(),
+def sanitize_subtitle_text(value: str) -> str:
+    """Normalize Arabic subtitle text and remove invisible bidi controls.
+
+    The removed controls are useful in editors but can appear as square glyphs
+    in libass or fallback fonts. Pillow renders the cleaned, reshaped text into
+    PNG cards, so the result is stable across Docker images.
+    """
+    cleaned = unicodedata.normalize("NFC", str(value or ""))
+    cleaned = re.sub(
+        r"[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]",
+        "",
+        cleaned,
     )
+    cleaned = cleaned.replace("�", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def split_professional_subtitle_chunks(
+    narration: str,
+    max_words: int = 7,
+    min_words: int = 3,
+    max_chars: int = 54,
+) -> List[str]:
+    """Create readable subtitle phrases while respecting punctuation."""
+    value = sanitize_subtitle_text(narration)
 
     if not value:
         return []
 
-    sentence_parts = re.split(
-        r"(?<=[.!؟!؛])\s+|\n+",
-        value,
-    )
-
+    # Keep punctuation attached to its phrase and prefer a break after it.
+    words = value.split()
     chunks: List[str] = []
+    current: List[str] = []
 
-    for sentence in sentence_parts:
-        words = sentence.strip().split()
+    for word in words:
+        current.append(word)
+        current_text = " ".join(current)
+        ends_phrase = bool(re.search(r"[،؛:,.!?؟]$", word))
 
-        if not words:
-            continue
-
-        while len(words) > max_words:
-            chunks.append(" ".join(words[:max_words]))
-            words = words[max_words:]
-
-        if words:
-            current = " ".join(words)
-
-            if (
-                chunks
-                and len(words) < min_words
-                and (
-                    len(chunks[-1].split())
-                    + len(words)
-                    <= max_words + 2
-                )
-            ):
-                chunks[-1] = (
-                    chunks[-1].rstrip()
-                    + " "
-                    + current
-                )
-            else:
-                chunks.append(current)
-
-    return chunks
-
-
-def wrap_subtitle_text(text: str) -> str:
-    """Split one subtitle cue into at most two visually balanced lines."""
-    words = str(text or "").strip().split()
-
-    if len(words) <= 3:
-        return " ".join(words)
-
-    best_index = max(1, len(words) // 2)
-    best_difference = None
-
-    for index in range(1, len(words)):
-        first = " ".join(words[:index])
-        second = " ".join(words[index:])
-        difference = abs(len(first) - len(second))
-
-        if best_difference is None or difference < best_difference:
-            best_difference = difference
-            best_index = index
-
-    first_line = " ".join(words[:best_index])
-    second_line = " ".join(words[best_index:])
-
-    return first_line + "\n" + second_line
-
-
-def escape_ass_text(text: str) -> str:
-    value = str(text or "")
-    value = value.replace("\\", r"\\")
-    value = value.replace("{", "(")
-    value = value.replace("}", ")")
-    value = value.replace("\r", " ")
-    value = value.replace("\n", r"\N")
-    return value
-
-
-def ass_timestamp(seconds: float) -> str:
-    total_centiseconds = max(
-        int(round(float(seconds) * 100)),
-        0,
-    )
-
-    hours = total_centiseconds // 360000
-    remainder = total_centiseconds % 360000
-    minutes = remainder // 6000
-    remainder %= 6000
-    secs = remainder // 100
-    centiseconds = remainder % 100
-
-    return (
-        f"{hours}:"
-        f"{minutes:02d}:"
-        f"{secs:02d}."
-        f"{centiseconds:02d}"
-    )
-
-
-def create_ass_subtitles(
-    output_path: Path,
-    narration: str,
-    duration: float,
-    width: int,
-    height: int,
-    image_left: int,
-    image_right: int,
-    image_bottom: int,
-) -> int:
-    """Create readable Arabic subtitles inside the lower part of the news image.
-
-    The timing is distributed by word count. This is intentionally deterministic
-    and requires no external transcription service.
-    """
-    chunks = split_narration_chunks(narration)
-
-    if not chunks:
-        output_path.write_text("", encoding="utf-8")
-        return 0
-
-    total_words = sum(max(len(chunk.split()), 1) for chunk in chunks)
-    scale = min(width / 1080, height / 1920)
-
-    font_size = max(int(round(54 * scale)), 42)
-
-    # Constrain subtitles to the safe inner width of the news image.
-    inner_padding = max(int(round(72 * scale)), 48)
-    margin_left = max(image_left + inner_padding, 20)
-    margin_right = max(width - image_right + inner_padding, 20)
-
-    # Keep the subtitle clearly above the lower gold frame.
-    subtitle_bottom = image_bottom - max(
-        int(round(62 * scale)),
-        42,
-    )
-    margin_vertical = max(height - subtitle_bottom, 20)
-
-    header = f"""[Script Info]
-Title: MarketPulseX365 synchronized narration
-ScriptType: v4.00+
-PlayResX: {width}
-PlayResY: {height}
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-YCbCr Matrix: TV.709
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: MPXSubtitle,Noto Sans Arabic,{font_size},&H00FFFFFF,&H00FFFFFF,&H00180B03,&H98180B03,-1,0,0,0,100,100,0,0,3,5,0,2,{margin_left},{margin_right},{margin_vertical},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-    events: List[str] = []
-    elapsed_words = 0
-    safe_duration = max(float(duration), 0.1)
-
-    for index, chunk in enumerate(chunks):
-        chunk_words = max(len(chunk.split()), 1)
-        start_seconds = safe_duration * elapsed_words / total_words
-        elapsed_words += chunk_words
-        end_seconds = safe_duration * elapsed_words / total_words
-
-        if index == len(chunks) - 1:
-            end_seconds = safe_duration
-
-        # Prevent ultra-short flashes.
-        if end_seconds - start_seconds < 0.55:
-            end_seconds = min(start_seconds + 0.55, safe_duration)
-
-        subtitle_text = escape_ass_text(wrap_subtitle_text(chunk))
-
-        events.append(
-            "Dialogue: 0,"
-            f"{ass_timestamp(start_seconds)},"
-            f"{ass_timestamp(end_seconds)},"
-            "MPXSubtitle,,0,0,0,,"
-            f"{subtitle_text}"
+        should_break = (
+            len(current) >= max_words
+            or len(current_text) >= max_chars
+            or (len(current) >= min_words and ends_phrase)
         )
 
-    output_path.write_text(
-        header + "\n".join(events) + "\n",
-        encoding="utf-8",
+        if should_break:
+            chunks.append(current_text)
+            current = []
+
+    if current:
+        tail = " ".join(current)
+        if (
+            chunks
+            and len(current) < min_words
+            and len(chunks[-1].split()) + len(current) <= max_words + 2
+            and len(chunks[-1]) + 1 + len(tail) <= max_chars + 12
+        ):
+            chunks[-1] = chunks[-1].rstrip() + " " + tail
+        else:
+            chunks.append(tail)
+
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def detect_audio_pause_points(audio_path: Path, duration: float) -> List[float]:
+    """Detect short natural pauses in narration for better cue boundaries."""
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(audio_path),
+            "-af",
+            "silencedetect=noise=-38dB:d=0.12",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
     )
 
-    return len(events)
+    starts = [
+        float(value)
+        for value in re.findall(r"silence_start:\s*([0-9.]+)", result.stderr)
+    ]
+    ends = [
+        float(value)
+        for value in re.findall(r"silence_end:\s*([0-9.]+)", result.stderr)
+    ]
 
-def escape_ffmpeg_filter_path(path: Path) -> str:
-    value = str(path)
-    value = value.replace("\\", r"\\")
-    value = value.replace(":", r"\:")
-    value = value.replace("'", r"\'")
-    return value
+    points: List[float] = []
+    for index, start in enumerate(starts):
+        end = ends[index] if index < len(ends) else start
+        point = (start + end) / 2.0
+        if 0.25 < point < max(duration - 0.25, 0.25):
+            points.append(point)
+
+    return sorted(set(points))
+
+
+def build_subtitle_timeline(
+    narration: str,
+    duration: float,
+    audio_path: Path,
+) -> List[tuple[float, float, str]]:
+    """Distribute cues by spoken-text weight and snap changes to pauses."""
+    chunks = split_professional_subtitle_chunks(narration)
+
+    if not chunks:
+        return []
+
+    safe_duration = max(float(duration), 0.1)
+    weights: List[float] = []
+
+    for chunk in chunks:
+        letters = len(re.sub(r"\s+", "", chunk))
+        pause_weight = 0.0
+        if re.search(r"[.!?؟]$", chunk):
+            pause_weight = 8.0
+        elif re.search(r"[،؛,:]$", chunk):
+            pause_weight = 4.0
+        weights.append(max(float(letters) + pause_weight, 1.0))
+
+    total_weight = sum(weights)
+    boundaries = [0.0]
+    elapsed = 0.0
+    for weight in weights[:-1]:
+        elapsed += weight
+        boundaries.append(safe_duration * elapsed / total_weight)
+    boundaries.append(safe_duration)
+
+    pause_points = detect_audio_pause_points(audio_path, safe_duration)
+    snapped = [0.0]
+
+    for target in boundaries[1:-1]:
+        previous = snapped[-1]
+        candidates = [
+            point
+            for point in pause_points
+            if point >= previous + 0.90 and point <= safe_duration - 0.90
+        ]
+        if candidates:
+            nearest = min(candidates, key=lambda point: abs(point - target))
+            if abs(nearest - target) <= 0.80:
+                target = nearest
+        target = max(target, previous + 0.90)
+        snapped.append(min(target, safe_duration - 0.90))
+
+    snapped.append(safe_duration)
+
+    # Repair any compressed final cues while keeping the timeline monotonic.
+    for index in range(len(snapped) - 2, 0, -1):
+        if snapped[index + 1] - snapped[index] < 0.90:
+            snapped[index] = max(snapped[index + 1] - 0.90, snapped[index - 1] + 0.90)
+
+    timeline: List[tuple[float, float, str]] = []
+    for index, chunk in enumerate(chunks):
+        start = max(snapped[index], 0.0)
+        end = min(snapped[index + 1], safe_duration)
+        if end > start:
+            timeline.append((start, end, chunk))
+
+    return timeline
+
+
+def create_subtitle_cards(
+    job_dir: Path,
+    narration: str,
+    duration: float,
+    audio_path: Path,
+    width: int,
+    height: int,
+) -> List[tuple[Path, float, float]]:
+    """Render each Arabic cue as a polished rounded PNG card.
+
+    This avoids the tight per-line black boxes and occasional missing Arabic
+    glyphs produced by font fallback inside ASS/libass.
+    """
+    timeline = build_subtitle_timeline(narration, duration, audio_path)
+
+    if not timeline:
+        return []
+
+    scale_x = width / BASE_WIDTH
+    scale_y = height / BASE_HEIGHT
+    scale = min(scale_x, scale_y)
+
+    panel_left = int(round(SUBTITLE_PANEL_BOX[0] * scale_x))
+    panel_top = int(round(SUBTITLE_PANEL_BOX[1] * scale_y))
+    panel_right = int(round(SUBTITLE_PANEL_BOX[2] * scale_x))
+    panel_bottom = int(round(SUBTITLE_PANEL_BOX[3] * scale_y))
+    panel_width = max(panel_right - panel_left, 1)
+    panel_height = max(panel_bottom - panel_top, 1)
+
+    bold_font_path = find_font(bold=True)
+    cards: List[tuple[Path, float, float]] = []
+
+    for index, (start, end, cue_text) in enumerate(timeline, start=1):
+        card = Image.new("RGBA", (panel_width, panel_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(card)
+
+        radius = max(int(round(24 * scale)), 16)
+        border_width = max(int(round(2 * scale)), 2)
+        accent_width = max(int(round(4 * scale)), 3)
+
+        draw.rounded_rectangle(
+            (1, 1, panel_width - 2, panel_height - 2),
+            radius=radius,
+            fill=(2, 13, 33, 214),
+            outline=(226, 177, 61, 210),
+            width=border_width,
+        )
+        draw.rounded_rectangle(
+            (
+                int(round(26 * scale)),
+                int(round(12 * scale)),
+                panel_width - int(round(26 * scale)),
+                int(round(12 * scale)) + accent_width,
+            ),
+            radius=max(accent_width // 2, 1),
+            fill=(238, 190, 72, 225),
+        )
+
+        max_text_width = panel_width - int(round(72 * scale))
+        max_text_height = panel_height - int(round(40 * scale))
+        selected_font = None
+        selected_lines: List[str] = []
+
+        for base_size in range(50, 37, -2):
+            font = load_font(
+                bold_font_path,
+                max(int(round(base_size * scale)), 36),
+            )
+            lines = wrap_rtl_text(
+                text=sanitize_subtitle_text(cue_text),
+                font=font,
+                max_width=max_text_width,
+                draw=draw,
+                max_lines=2,
+            )
+
+            line_heights = []
+            for line in lines:
+                bbox = text_bbox(
+                    draw=draw,
+                    text=prepare_arabic(line),
+                    font=font,
+                    stroke_width=1,
+                )
+                line_heights.append(bbox[3] - bbox[1])
+
+            line_gap = max(int(round(12 * scale)), 8)
+            total_height = sum(line_heights) + max(len(lines) - 1, 0) * line_gap
+
+            if lines and total_height <= max_text_height:
+                selected_font = font
+                selected_lines = lines
+                break
+
+        if selected_font is None:
+            selected_font = load_font(bold_font_path, max(int(round(38 * scale)), 34))
+            selected_lines = wrap_rtl_text(
+                text=sanitize_subtitle_text(cue_text),
+                font=selected_font,
+                max_width=max_text_width,
+                draw=draw,
+                max_lines=2,
+            )
+
+        prepared_lines = [prepare_arabic(line) for line in selected_lines]
+        line_gap = max(int(round(12 * scale)), 8)
+        heights = []
+        for line in prepared_lines:
+            bbox = text_bbox(
+                draw=draw,
+                text=line,
+                font=selected_font,
+                stroke_width=1,
+            )
+            heights.append(bbox[3] - bbox[1])
+
+        total_height = sum(heights) + max(len(heights) - 1, 0) * line_gap
+        cursor_y = (panel_height - total_height) // 2 - int(round(1 * scale))
+
+        for line, line_height in zip(prepared_lines, heights):
+            center_y = cursor_y + line_height // 2
+            # Soft shadow plus crisp white text.
+            draw.text(
+                (panel_width // 2 + 2, center_y + 3),
+                line,
+                font=selected_font,
+                fill=(0, 0, 0, 170),
+                anchor="mm",
+            )
+            draw.text(
+                (panel_width // 2, center_y),
+                line,
+                font=selected_font,
+                fill=(255, 255, 255, 255),
+                stroke_width=max(int(round(1 * scale)), 1),
+                stroke_fill=(4, 10, 24, 230),
+                anchor="mm",
+            )
+            cursor_y += line_height + line_gap
+
+        card_path = job_dir / f"subtitle-card-{index:02d}.png"
+        card.save(card_path, format="PNG", optimize=True)
+        cards.append((card_path, start, end))
+
+    return cards
 
 def create_layout_assets(
     background_path: Path,
@@ -638,16 +751,16 @@ def create_layout_assets(
         return int(round(value * scale_y))
 
     # News image inner area for the approved new template.
-    photo_left = sx(PHOTO_BOX[0])
-    photo_top = sy(PHOTO_BOX[1])
-    photo_right = sx(PHOTO_BOX[2])
-    photo_bottom = sy(PHOTO_BOX[3])
+    photo_left = sx(PHOTO_WINDOW_BOX[0])
+    photo_top = sy(PHOTO_WINDOW_BOX[1])
+    photo_right = sx(PHOTO_WINDOW_BOX[2])
+    photo_bottom = sy(PHOTO_WINDOW_BOX[3])
     photo_radius = max(int(round(PHOTO_RADIUS * scale)), 1)
 
     transparent_mask = Image.new("L", (width, height), 0)
     mask_draw = ImageDraw.Draw(transparent_mask)
     mask_draw.rounded_rectangle(
-        (photo_left, photo_top, photo_right, photo_bottom),
+        (photo_left, photo_top, photo_right - 1, photo_bottom - 1),
         radius=photo_radius,
         fill=255,
     )
@@ -933,13 +1046,14 @@ def health() -> dict:
     return {
         "status": "ok",
         "version": APP_VERSION,
+        "build": BUILD_NAME,
         "raqm_enabled": features.check_feature("raqm"),
         "intro_exists": (ASSETS_DIR / "intro.mp4").exists(),
         "outro_exists": (ASSETS_DIR / "outro.mp4").exists(),
         "logo_exists": LOGO_PATH.exists(),
         "template_exists": TEMPLATE_PATH.exists(),
-        "subtitles_engine": "libass",
-        "template_reference": "approved-template-2026-07-final-v5",
+        "subtitles_engine": "pillow-cards-pause-sync-v2",
+        "template_reference": "approved-template-2026-07-photo-fill-v2",
     }
 
 
@@ -1059,24 +1173,28 @@ def render(
         clip_paths: List[Path] = []
         subtitle_segments = 0
 
-        image_x = int(round(PHOTO_BOX[0] * width / BASE_WIDTH))
-        image_y = int(round(PHOTO_BOX[1] * height / BASE_HEIGHT))
-        image_w = int(round((PHOTO_BOX[2] - PHOTO_BOX[0]) * width / BASE_WIDTH))
-        image_h = int(round((PHOTO_BOX[3] - PHOTO_BOX[1]) * height / BASE_HEIGHT))
+        image_x = int(round(PHOTO_RENDER_BOX[0] * width / BASE_WIDTH))
+        image_y = int(round(PHOTO_RENDER_BOX[1] * height / BASE_HEIGHT))
+        image_w = int(round((PHOTO_RENDER_BOX[2] - PHOTO_RENDER_BOX[0]) * width / BASE_WIDTH))
+        image_h = int(round((PHOTO_RENDER_BOX[3] - PHOTO_RENDER_BOX[1]) * height / BASE_HEIGHT))
+        # H.264 works most reliably with even dimensions.
+        image_w = max((image_w // 2) * 2, 2)
+        image_h = max((image_h // 2) * 2, 2)
 
         for index, image_path in enumerate(image_paths, start=1):
             clip_path = job_dir / f"clip-{index:02d}.mp4"
 
             frames = max(int(seconds_per_image * fps), 1)
-            zoom_step = 0.00018
+            zoom_step = 0.00016
 
             filter_complex = (
                 f"[0:v]"
                 f"scale={image_w}:{image_h}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={image_w}:{image_h},"
+                "force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={image_w}:{image_h}:(iw-ow)/2:(ih-oh)/2,"
+                "setsar=1,"
                 f"zoompan="
-                f"z='min(max(pzoom,1.0)+{zoom_step},1.018)':"
+                f"z='min(max(pzoom,1.0)+{zoom_step},1.022)':"
                 f"x='iw/2-(iw/zoom/2)':"
                 f"y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:"
@@ -1164,18 +1282,16 @@ def render(
         )
 
         middle = job_dir / "middle.mp4"
-        subtitles_path = job_dir / "subtitles.ass"
 
-        subtitle_segments = create_ass_subtitles(
-            output_path=subtitles_path,
+        subtitle_cards = create_subtitle_cards(
+            job_dir=job_dir,
             narration=narration,
             duration=audio_duration,
+            audio_path=audio_path,
             width=width,
             height=height,
-            image_left=image_x,
-            image_right=image_x + image_w,
-            image_bottom=image_y + image_h,
         )
+        subtitle_segments = len(subtitle_cards)
 
         middle_command = [
             "ffmpeg",
@@ -1186,23 +1302,59 @@ def render(
             str(audio_path),
         ]
 
-        if subtitle_segments > 0:
-            escaped_subtitles_path = (
-                escape_ffmpeg_filter_path(
-                    subtitles_path
+        if subtitle_cards:
+            for card_path, _, _ in subtitle_cards:
+                middle_command.extend(
+                    [
+                        "-loop",
+                        "1",
+                        "-framerate",
+                        str(fps),
+                        "-i",
+                        str(card_path),
+                    ]
                 )
-            )
 
-            subtitle_filter = (
-                "subtitles="
-                f"filename='{escaped_subtitles_path}':"
-                "fontsdir='/usr/share/fonts'"
-            )
+            panel_x = int(round(SUBTITLE_PANEL_BOX[0] * width / BASE_WIDTH))
+            panel_y = int(round(SUBTITLE_PANEL_BOX[1] * height / BASE_HEIGHT))
+
+            filter_parts: List[str] = ["[0:v]format=rgba[v0]"]
+            current_label = "v0"
+
+            for card_index, (_, start, end) in enumerate(subtitle_cards, start=2):
+                cue_duration = max(end - start, 0.20)
+                fade_duration = min(0.14, cue_duration / 3.0)
+                fade_out_start = max(cue_duration - fade_duration, 0.0)
+                card_label = f"card{card_index}"
+                next_label = f"v{card_index - 1}"
+
+                filter_parts.append(
+                    f"[{card_index}:v]format=rgba,"
+                    f"trim=duration={cue_duration:.3f},"
+                    "setpts=PTS-STARTPTS,"
+                    f"fade=t=in:st=0:d={fade_duration:.3f}:alpha=1,"
+                    f"fade=t=out:st={fade_out_start:.3f}:d={fade_duration:.3f}:alpha=1,"
+                    f"setpts=PTS+{start:.3f}/TB"
+                    f"[{card_label}]"
+                )
+                filter_parts.append(
+                    f"[{current_label}][{card_label}]"
+                    f"overlay={panel_x}:{panel_y}:"
+                    "eof_action=pass:shortest=0"
+                    f"[{next_label}]"
+                )
+                current_label = next_label
+
+            filter_parts.append(f"[{current_label}]format=yuv420p[vout]")
 
             middle_command.extend(
                 [
-                    "-vf",
-                    subtitle_filter,
+                    "-filter_complex",
+                    ";".join(filter_parts),
+                    "-map",
+                    "[vout]",
+                    "-map",
+                    "1:a:0",
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -1214,6 +1366,10 @@ def render(
         else:
             middle_command.extend(
                 [
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
                     "-c:v",
                     "copy",
                 ]
@@ -1221,10 +1377,6 @@ def render(
 
         middle_command.extend(
             [
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
                 "-c:a",
                 "aac",
                 "-ar",
@@ -1330,6 +1482,7 @@ def render(
     return {
         "status": "completed",
         "version": APP_VERSION,
+        "build": BUILD_NAME,
         "raqm_enabled": features.check_feature("raqm"),
         "job_id": job_id,
         "video_url": file_url,
