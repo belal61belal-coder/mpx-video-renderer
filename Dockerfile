@@ -16,11 +16,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY app.py /app/app.py
 COPY logo.png /app/logo.png
+COPY base_template.png /app/base_template.png
 
 ENV DATA_DIR=/data
 ENV LOGO_PATH=/app/logo.png
+ENV TEMPLATE_PATH=/app/base_template.png
 
 EXPOSE 8000
 
