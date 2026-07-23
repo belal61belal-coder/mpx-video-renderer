@@ -24,7 +24,7 @@ LOGO_PATH = Path(os.getenv("LOGO_PATH", "/app/logo.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "3.0.2"
 SITE_TEXT = "MarketPulseX365.com"
 TRANSITION_SECONDS = 0.35
 
@@ -259,6 +259,7 @@ def wrap_rtl_text(
 
 
 
+
 def find_latin_font(bold: bool = False) -> str:
     preferred_names = (
         (
@@ -299,9 +300,72 @@ def normalize_date_text(value: str) -> str:
     digits = re.sub(r"\D", "", raw)
 
     if len(digits) == 8:
-        return f"{digits[0:2]}/{digits[2:4]}/{digits[4:8]}"
+        day = digits[0:2]
+        month = digits[2:4]
+        year = digits[4:8]
+        return f"{day}/{month}/{year}"
 
     return raw
+
+
+def crop_transparent_image(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    bbox = alpha.getbbox()
+
+    if bbox:
+        return rgba.crop(bbox)
+
+    return rgba
+
+
+def choose_headline_font(
+    draw: ImageDraw.ImageDraw,
+    headline: str,
+    bold_font_path: str,
+    max_width: int,
+    max_height: int,
+) -> tuple[ImageFont.FreeTypeFont, List[str]]:
+    for size in range(70, 49, -2):
+        font = load_font(bold_font_path, size)
+        lines = wrap_rtl_text(
+            text=headline,
+            font=font,
+            max_width=max_width,
+            draw=draw,
+            max_lines=3,
+        )
+
+        if not lines:
+            return font, []
+
+        total_height = 0
+
+        for line in lines:
+            display_line = prepare_arabic(line)
+            bbox = text_bbox(
+                draw=draw,
+                text=display_line,
+                font=font,
+                stroke_width=1,
+            )
+            total_height += bbox[3] - bbox[1]
+
+        total_height += max(len(lines) - 1, 0) * 24
+
+        if total_height <= max_height:
+            return font, lines
+
+    fallback_font = load_font(bold_font_path, 50)
+    fallback_lines = wrap_rtl_text(
+        text=headline,
+        font=fallback_font,
+        max_width=max_width,
+        draw=draw,
+        max_lines=3,
+    )
+
+    return fallback_font, fallback_lines
 
 
 def create_layout_assets(
@@ -313,43 +377,117 @@ def create_layout_assets(
     width: int,
     height: int,
 ) -> None:
-    # Background layer: opaque, clean, and subtle.
+    # Layout constants for a 1080 x 1920 vertical video.
+    scale_x = width / 1080
+    scale_y = height / 1920
+
+    def sx(value: int) -> int:
+        return int(round(value * scale_x))
+
+    def sy(value: int) -> int:
+        return int(round(value * scale_y))
+
+    photo_x = sx(40)
+    photo_y = sy(180)
+    photo_w = width - sx(80)
+    photo_h = sy(640)
+
+    card_x = sx(40)
+    card_y = sy(850)
+    card_w = width - sx(80)
+    card_h = sy(900)
+
+    # Opaque base layer.
     background = Image.new(
         "RGBA",
         (width, height),
-        (4, 14, 36, 255),
+        (4, 13, 34, 255),
     )
     bg_draw = ImageDraw.Draw(background)
 
+    # Restrained navy gradient.
     for y in range(height):
         progress = y / max(height - 1, 1)
-        r = int(4 + 4 * progress)
-        g = int(14 + 10 * progress)
-        b = int(36 + 25 * progress)
+        r = int(4 + 3 * progress)
+        g = int(13 + 9 * progress)
+        b = int(34 + 20 * progress)
 
         bg_draw.line(
             (0, y, width, y),
             fill=(r, g, b, 255),
         )
 
-    # Soft decorative shapes for depth.
-    bg_draw.ellipse(
-        (-340, -260, 520, 600),
-        fill=(17, 62, 128, 55),
+    # Header panel.
+    bg_draw.rounded_rectangle(
+        (
+            sx(28),
+            sy(24),
+            width - sx(28),
+            sy(150),
+        ),
+        radius=sx(24),
+        fill=(3, 12, 31, 248),
+        outline=(255, 255, 255, 18),
+        width=max(sx(1), 1),
     )
-    bg_draw.ellipse(
-        (680, 1180, 1380, 2020),
-        fill=(14, 55, 115, 45),
+
+    # Photo shadow and backing.
+    bg_draw.rounded_rectangle(
+        (
+            photo_x - sx(8),
+            photo_y + sy(8),
+            photo_x + photo_w + sx(8),
+            photo_y + photo_h + sy(18),
+        ),
+        radius=sx(24),
+        fill=(0, 0, 0, 92),
+    )
+
+    bg_draw.rounded_rectangle(
+        (
+            photo_x - sx(3),
+            photo_y - sy(3),
+            photo_x + photo_w + sx(3),
+            photo_y + photo_h + sy(3),
+        ),
+        radius=sx(20),
+        fill=(216, 173, 40, 255),
+    )
+
+    # Headline card.
+    bg_draw.rounded_rectangle(
+        (
+            card_x,
+            card_y,
+            card_x + card_w,
+            card_y + card_h,
+        ),
+        radius=sx(34),
+        fill=(4, 16, 38, 255),
+        outline=(255, 255, 255, 20),
+        width=max(sx(1), 1),
+    )
+
+    # Footer separator.
+    bg_draw.line(
+        (
+            sx(54),
+            sy(1810),
+            width - sx(54),
+            sy(1810),
+        ),
+        fill=(213, 171, 39, 135),
+        width=max(sy(2), 1),
     )
 
     background.convert("RGB").save(
         background_path,
         format="JPEG",
-        quality=94,
+        quality=95,
         optimize=True,
     )
 
-    # Overlay layer: transparent graphics over the animated photo.
+    # Transparent graphics layer.
     overlay = Image.new(
         "RGBA",
         (width, height),
@@ -359,112 +497,82 @@ def create_layout_assets(
 
     regular_font_path = find_font(bold=False)
     bold_font_path = find_font(bold=True)
-    latin_font_path = find_latin_font(bold=False)
+    latin_regular_path = find_latin_font(bold=False)
+    latin_bold_path = find_latin_font(bold=True)
 
-    date_font = load_font(regular_font_path, 36)
-    category_font = load_font(bold_font_path, 38)
-    headline_font = load_font(bold_font_path, 64)
-    site_font = ImageFont.truetype(latin_font_path, 30)
-
-    # Thin premium brand accents.
+    date_font = ImageFont.truetype(
+        latin_bold_path,
+        sx(34),
+    )
+    category_font = load_font(
+        bold_font_path,
+        sx(38),
+    )
+    site_font = ImageFont.truetype(
+        latin_regular_path,
+        sx(32),
+    )
+    # Premium gold top edge.
     draw.rectangle(
-        (0, 0, width, 8),
-        fill=(231, 185, 42, 255),
-    )
-    draw.rectangle(
-        (0, height - 8, width, height),
-        fill=(231, 185, 42, 255),
+        (0, 0, width, max(sy(7), 1)),
+        fill=(216, 173, 40, 255),
     )
 
-    # Header safe area.
-    draw.rounded_rectangle(
-        (28, 25, width - 28, 155),
-        radius=28,
-        fill=(3, 13, 34, 205),
-        outline=(255, 255, 255, 28),
-        width=1,
-    )
-
+    # Date uses a Latin font, so slashes always render correctly.
     date_value = normalize_date_text(date_text)
 
     if date_value:
-        date_bbox = draw.textbbox(
-            (0, 0),
-            date_value,
-            font=date_font,
-        )
-        date_width = date_bbox[2] - date_bbox[0]
-        date_height = date_bbox[3] - date_bbox[1]
-
-        date_x = 55
-        date_y = 56
-        pad_x = 22
-        pad_y = 13
-
-        draw.rounded_rectangle(
-            (
-                date_x,
-                date_y,
-                date_x + date_width + pad_x * 2,
-                date_y + date_height + pad_y * 2,
-            ),
-            radius=18,
-            fill=(8, 27, 60, 235),
-            outline=(231, 185, 42, 185),
-            width=2,
-        )
-
         draw.text(
-            (
-                date_x + pad_x,
-                date_y + pad_y - 3,
-            ),
+            (sx(58), sy(87)),
             date_value,
             font=date_font,
             fill=(255, 255, 255, 255),
+            anchor="lm",
         )
 
-    # Larger logo in the header.
+        draw.rounded_rectangle(
+            (
+                sx(54),
+                sy(118),
+                sx(255),
+                sy(122),
+            ),
+            radius=sx(2),
+            fill=(216, 173, 40, 225),
+        )
+
+    # Crop transparent padding from the logo before sizing it.
     if LOGO_PATH.exists():
-        logo = Image.open(LOGO_PATH).convert("RGBA")
+        logo = crop_transparent_image(
+            Image.open(LOGO_PATH)
+        )
         logo.thumbnail(
-            (245, 245),
+            (sx(150), sy(118)),
             Image.Resampling.LANCZOS,
         )
 
-        logo_x = width - logo.width - 34
-        logo_y = 8
+        logo_x = width - logo.width - sx(50)
+        logo_y = sy(37)
 
         overlay.alpha_composite(
             logo,
             (logo_x, logo_y),
         )
 
-    # Strong, elegant readability panel over the lower photo.
-    panel_top = 1050
-    panel_height = height - panel_top
-
-    for offset in range(panel_height):
-        progress = offset / max(panel_height - 1, 1)
-        alpha = int(55 + (190 * progress))
-
-        draw.line(
-            (
-                0,
-                panel_top + offset,
-                width,
-                panel_top + offset,
-            ),
-            fill=(3, 12, 31, alpha),
-        )
-
-    # Gold accent line above the text block.
+    # Fine photo border.
     draw.rounded_rectangle(
-        (54, 1100, width - 54, 1107),
-        radius=4,
-        fill=(231, 185, 42, 235),
+        (
+            photo_x,
+            photo_y,
+            photo_x + photo_w,
+            photo_y + photo_h,
+        ),
+        radius=sx(18),
+        outline=(216, 173, 40, 220),
+        width=max(sx(2), 1),
     )
 
+    # Category with a minimal professional treatment.
     category_raw = str(category or "الأخبار").strip()
     category_display = prepare_arabic(category_raw)
 
@@ -477,10 +585,10 @@ def create_layout_assets(
     category_width = category_bbox[2] - category_bbox[0]
     category_height = category_bbox[3] - category_bbox[1]
 
-    category_right = width - 55
-    category_top = 1150
-    category_pad_x = 28
-    category_pad_y = 14
+    category_right = card_x + card_w - sx(42)
+    category_top = card_y + sy(62)
+    category_pad_x = sx(26)
+    category_pad_y = sy(13)
 
     category_left = (
         category_right
@@ -500,17 +608,17 @@ def create_layout_assets(
             category_right,
             category_bottom,
         ),
-        radius=26,
-        fill=(18, 101, 205, 245),
-        outline=(120, 203, 255, 185),
-        width=2,
+        radius=sx(20),
+        fill=(12, 73, 151, 248),
+        outline=(96, 185, 244, 185),
+        width=max(sx(2), 1),
     )
 
     draw_rtl_text(
         draw=draw,
         position=(
             category_right - category_pad_x,
-            category_top + category_pad_y - 2,
+            category_top + category_pad_y - sy(2),
         ),
         text=category_display,
         font=category_font,
@@ -518,85 +626,119 @@ def create_layout_assets(
         anchor="ra",
     )
 
-    headline_lines = wrap_rtl_text(
-        text=headline,
-        font=headline_font,
-        max_width=width - 110,
-        draw=draw,
-        max_lines=3,
+    # Gold accent beside the title, aligned for RTL reading.
+    accent_x = card_x + card_w - sx(42)
+    title_top = category_bottom + sy(54)
+
+    draw.rounded_rectangle(
+        (
+            accent_x - sx(7),
+            title_top,
+            accent_x,
+            card_y + card_h - sy(170),
+        ),
+        radius=sx(4),
+        fill=(216, 173, 40, 245),
     )
 
-    headline_y = category_bottom + 38
-    line_spacing = 18
+    max_title_width = card_w - sx(120)
+    max_title_height = sy(420)
+
+    headline_font, headline_lines = choose_headline_font(
+        draw=draw,
+        headline=headline,
+        bold_font_path=bold_font_path,
+        max_width=max_title_width,
+        max_height=max_title_height,
+    )
+
+    line_spacing = sy(24)
+    line_heights: List[int] = []
 
     for line in headline_lines:
         display_line = prepare_arabic(line)
+        bbox = text_bbox(
+            draw=draw,
+            text=display_line,
+            font=headline_font,
+            stroke_width=1,
+        )
+        line_heights.append(bbox[3] - bbox[1])
+
+    title_block_height = (
+        sum(line_heights)
+        + max(len(line_heights) - 1, 0) * line_spacing
+    )
+
+    title_area_top = title_top
+    title_area_bottom = card_y + card_h - sy(190)
+    title_area_height = title_area_bottom - title_area_top
+
+    headline_y = (
+        title_area_top
+        + max((title_area_height - title_block_height) // 2, 0)
+    )
+
+    for line, line_height in zip(
+        headline_lines,
+        line_heights,
+    ):
+        display_line = prepare_arabic(line)
+
+        # Soft shadow.
+        draw_rtl_text(
+            draw=draw,
+            position=(
+                accent_x - sx(30) + sx(2),
+                headline_y + sy(3),
+            ),
+            text=display_line,
+            font=headline_font,
+            fill=(0, 0, 0, 115),
+            anchor="ra",
+        )
 
         draw_rtl_text(
             draw=draw,
             position=(
-                width - 55,
+                accent_x - sx(30),
                 headline_y,
             ),
             text=display_line,
             font=headline_font,
             fill=(255, 255, 255, 255),
-            stroke_width=2,
-            stroke_fill=(0, 0, 0, 125),
             anchor="ra",
         )
 
-        line_bbox = text_bbox(
-            draw=draw,
-            text=display_line,
-            font=headline_font,
-            stroke_width=2,
-        )
+        headline_y += line_height + line_spacing
 
-        headline_y += (
-            line_bbox[3]
-            - line_bbox[1]
-            + line_spacing
-        )
-
-    # Website on a clean footer chip, using a real Latin font.
+    # Website inside the card, visible but not dominant.
+    site_text = SITE_TEXT
     site_bbox = draw.textbbox(
         (0, 0),
-        SITE_TEXT,
+        site_text,
         font=site_font,
     )
     site_width = site_bbox[2] - site_bbox[0]
-    site_height = site_bbox[3] - site_bbox[1]
-
-    footer_y = height - 82
-    footer_pad_x = 22
-    footer_pad_y = 10
-    footer_left = (
-        width - site_width - footer_pad_x * 2
-    ) // 2
-    footer_right = footer_left + site_width + footer_pad_x * 2
-
-    draw.rounded_rectangle(
-        (
-            footer_left,
-            footer_y - footer_pad_y,
-            footer_right,
-            footer_y + site_height + footer_pad_y,
-        ),
-        radius=18,
-        fill=(3, 13, 34, 205),
-        outline=(255, 255, 255, 24),
-        width=1,
-    )
 
     draw.text(
         (
-            footer_left + footer_pad_x,
-            footer_y,
+            card_x + (card_w - site_width) // 2,
+            card_y + card_h - sy(92),
         ),
-        SITE_TEXT,
+        site_text,
         font=site_font,
-        fill=(225, 231, 240, 245),
+        fill=(190, 202, 219, 230),
+    )
+
+    draw.rectangle(
+        (
+            0,
+            height - max(sy(7), 1),
+            width,
+            height,
+        ),
+        fill=(216, 173, 40, 255),
     )
 
     overlay.save(
@@ -826,16 +968,16 @@ def render(
         seconds_per_image = audio_duration / len(image_paths)
         clip_paths: List[Path] = []
 
-        image_x = 0
-        image_y = 165
-        image_w = width
-        image_h = 1320
+        image_x = int(round(40 * width / 1080))
+        image_y = int(round(180 * height / 1920))
+        image_w = width - int(round(80 * width / 1080))
+        image_h = int(round(640 * height / 1920))
 
         for index, image_path in enumerate(image_paths, start=1):
             clip_path = job_dir / f"clip-{index:02d}.mp4"
 
             frames = max(int(seconds_per_image * fps), 1)
-            zoom_step = 0.0008
+            zoom_step = 0.00022
 
             filter_complex = (
                 f"[0:v]"
@@ -843,7 +985,7 @@ def render(
                 "force_original_aspect_ratio=increase,"
                 f"crop={image_w}:{image_h},"
                 f"zoompan="
-                f"z='min(zoom+{zoom_step},1.035)':"
+                f"z='min(max(pzoom,1.0)+{zoom_step},1.022)':"
                 f"x='iw/2-(iw/zoom/2)':"
                 f"y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:"
