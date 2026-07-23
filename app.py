@@ -24,7 +24,7 @@ LOGO_PATH = Path(os.getenv("LOGO_PATH", "/app/logo.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 SITE_TEXT = "MarketPulseX365.com"
 TRANSITION_SECONDS = 0.35
 
@@ -258,60 +258,134 @@ def wrap_rtl_text(
     return lines[:max_lines]
 
 
-def create_static_overlay(
-    output_path: Path,
+
+def find_latin_font(bold: bool = False) -> str:
+    preferred_names = (
+        (
+            "NotoSans-Bold.ttf",
+            "DejaVuSans-Bold.ttf",
+            "LiberationSans-Bold.ttf",
+        )
+        if bold
+        else (
+            "NotoSans-Regular.ttf",
+            "DejaVuSans.ttf",
+            "LiberationSans-Regular.ttf",
+        )
+    )
+
+    for base in (
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+    ):
+        if not base.exists():
+            continue
+
+        for name in preferred_names:
+            matches = list(base.rglob(name))
+
+            if matches:
+                return str(matches[0])
+
+    return find_font(bold=bold)
+
+
+def normalize_date_text(value: str) -> str:
+    raw = str(value or "").strip()
+
+    if not raw:
+        return ""
+
+    digits = re.sub(r"\D", "", raw)
+
+    if len(digits) == 8:
+        return f"{digits[0:2]}/{digits[2:4]}/{digits[4:8]}"
+
+    return raw
+
+
+def create_layout_assets(
+    background_path: Path,
+    overlay_path: Path,
     headline: str,
     category: str,
     date_text: str,
     width: int,
     height: int,
 ) -> None:
-    canvas = Image.new(
+    # Background layer: opaque, clean, and subtle.
+    background = Image.new(
+        "RGBA",
+        (width, height),
+        (4, 14, 36, 255),
+    )
+    bg_draw = ImageDraw.Draw(background)
+
+    for y in range(height):
+        progress = y / max(height - 1, 1)
+        r = int(4 + 4 * progress)
+        g = int(14 + 10 * progress)
+        b = int(36 + 25 * progress)
+
+        bg_draw.line(
+            (0, y, width, y),
+            fill=(r, g, b, 255),
+        )
+
+    # Soft decorative shapes for depth.
+    bg_draw.ellipse(
+        (-340, -260, 520, 600),
+        fill=(17, 62, 128, 55),
+    )
+    bg_draw.ellipse(
+        (680, 1180, 1380, 2020),
+        fill=(14, 55, 115, 45),
+    )
+
+    background.convert("RGB").save(
+        background_path,
+        format="JPEG",
+        quality=94,
+        optimize=True,
+    )
+
+    # Overlay layer: transparent graphics over the animated photo.
+    overlay = Image.new(
         "RGBA",
         (width, height),
         (0, 0, 0, 0),
     )
-
-    draw = ImageDraw.Draw(canvas)
+    draw = ImageDraw.Draw(overlay)
 
     regular_font_path = find_font(bold=False)
     bold_font_path = find_font(bold=True)
+    latin_font_path = find_latin_font(bold=False)
 
-    date_font = load_font(regular_font_path, 38)
-    category_font = load_font(bold_font_path, 40)
-    headline_font = load_font(bold_font_path, 60)
-    site_font = load_font(
-        regular_font_path,
-        30,
-    )
+    date_font = load_font(regular_font_path, 36)
+    category_font = load_font(bold_font_path, 38)
+    headline_font = load_font(bold_font_path, 64)
+    site_font = ImageFont.truetype(latin_font_path, 30)
 
-    # خلفية موحدة وهوية بصرية
-    draw.rectangle(
-        (0, 0, width, height),
-        fill=(5, 18, 45, 255),
-    )
-
-    for y in range(height):
-        progress = y / max(height - 1, 1)
-        alpha = int(20 + 35 * progress)
-
-        draw.line(
-            (0, y, width, y),
-            fill=(7, 26, 62 + alpha // 5, 255),
-        )
-
+    # Thin premium brand accents.
     draw.rectangle(
         (0, 0, width, 8),
-        fill=(230, 183, 40, 255),
+        fill=(231, 185, 42, 255),
     )
-
     draw.rectangle(
         (0, height - 8, width, height),
-        fill=(230, 183, 40, 255),
+        fill=(231, 185, 42, 255),
     )
 
-    # التاريخ
-    date_value = str(date_text or "").strip()
+    # Header safe area.
+    draw.rounded_rectangle(
+        (28, 25, width - 28, 155),
+        radius=28,
+        fill=(3, 13, 34, 205),
+        outline=(255, 255, 255, 28),
+        width=1,
+    )
+
+    date_value = normalize_date_text(date_text)
 
     if date_value:
         date_bbox = draw.textbbox(
@@ -319,92 +393,78 @@ def create_static_overlay(
             date_value,
             font=date_font,
         )
-
         date_width = date_bbox[2] - date_bbox[0]
         date_height = date_bbox[3] - date_bbox[1]
 
-        x = 48
-        y = 55
-        pad_x = 24
-        pad_y = 14
+        date_x = 55
+        date_y = 56
+        pad_x = 22
+        pad_y = 13
 
         draw.rounded_rectangle(
             (
-                x,
-                y,
-                x + date_width + pad_x * 2,
-                y + date_height + pad_y * 2,
+                date_x,
+                date_y,
+                date_x + date_width + pad_x * 2,
+                date_y + date_height + pad_y * 2,
             ),
             radius=18,
-            fill=(4, 19, 50, 225),
-            outline=(230, 183, 40, 190),
+            fill=(8, 27, 60, 235),
+            outline=(231, 185, 42, 185),
             width=2,
         )
 
         draw.text(
             (
-                x + pad_x,
-                y + pad_y - 3,
+                date_x + pad_x,
+                date_y + pad_y - 3,
             ),
             date_value,
             font=date_font,
             fill=(255, 255, 255, 255),
         )
 
-    # اللوجو
+    # Larger logo in the header.
     if LOGO_PATH.exists():
         logo = Image.open(LOGO_PATH).convert("RGBA")
         logo.thumbnail(
-            (230, 230),
+            (245, 245),
             Image.Resampling.LANCZOS,
         )
 
-        canvas.alpha_composite(
+        logo_x = width - logo.width - 34
+        logo_y = 8
+
+        overlay.alpha_composite(
             logo,
-            (width - logo.width - 38, 22),
+            (logo_x, logo_y),
         )
 
-    # إطار صورة الخبر 16:9
-    image_x = 60
-    image_y = 275
-    image_w = width - 120
-    image_h = 540
+    # Strong, elegant readability panel over the lower photo.
+    panel_top = 1050
+    panel_height = height - panel_top
 
+    for offset in range(panel_height):
+        progress = offset / max(panel_height - 1, 1)
+        alpha = int(55 + (190 * progress))
+
+        draw.line(
+            (
+                0,
+                panel_top + offset,
+                width,
+                panel_top + offset,
+            ),
+            fill=(3, 12, 31, alpha),
+        )
+
+    # Gold accent line above the text block.
     draw.rounded_rectangle(
-        (
-            image_x - 6,
-            image_y - 6,
-            image_x + image_w + 6,
-            image_y + image_h + 6,
-        ),
-        radius=26,
-        fill=(230, 183, 40, 255),
+        (54, 1100, width - 54, 1107),
+        radius=4,
+        fill=(231, 185, 42, 235),
     )
 
-    draw.rounded_rectangle(
-        (
-            image_x,
-            image_y,
-            image_x + image_w,
-            image_y + image_h,
-        ),
-        radius=22,
-        fill=(10, 26, 58, 255),
-    )
-
-    # فاصل
-    draw.rounded_rectangle(
-        (
-            60,
-            image_y + image_h + 55,
-            width - 60,
-            image_y + image_h + 61,
-        ),
-        radius=3,
-        fill=(230, 183, 40, 220),
-    )
-
-    # التصنيف
     category_raw = str(category or "الأخبار").strip()
     category_display = prepare_arabic(category_raw)
 
@@ -417,17 +477,16 @@ def create_static_overlay(
     category_width = category_bbox[2] - category_bbox[0]
     category_height = category_bbox[3] - category_bbox[1]
 
-    category_right = width - 60
-    category_top = 915
-    category_pad_x = 30
-    category_pad_y = 16
+    category_right = width - 55
+    category_top = 1150
+    category_pad_x = 28
+    category_pad_y = 14
 
     category_left = (
         category_right
         - category_width
         - category_pad_x * 2
     )
-
     category_bottom = (
         category_top
         + category_height
@@ -441,9 +500,9 @@ def create_static_overlay(
             category_right,
             category_bottom,
         ),
-        radius=28,
-        fill=(13, 91, 190, 245),
-        outline=(91, 185, 255, 210),
+        radius=26,
+        fill=(18, 101, 205, 245),
+        outline=(120, 203, 255, 185),
         width=2,
     )
 
@@ -459,17 +518,16 @@ def create_static_overlay(
         anchor="ra",
     )
 
-    # العنوان
     headline_lines = wrap_rtl_text(
         text=headline,
         font=headline_font,
-        max_width=width - 120,
+        max_width=width - 110,
         draw=draw,
         max_lines=3,
     )
 
-    headline_y = category_bottom + 45
-    line_spacing = 20
+    headline_y = category_bottom + 38
+    line_spacing = 18
 
     for line in headline_lines:
         display_line = prepare_arabic(line)
@@ -477,14 +535,14 @@ def create_static_overlay(
         draw_rtl_text(
             draw=draw,
             position=(
-                width - 60,
+                width - 55,
                 headline_y,
             ),
             text=display_line,
             font=headline_font,
             fill=(255, 255, 255, 255),
             stroke_width=2,
-            stroke_fill=(0, 0, 0, 150),
+            stroke_fill=(0, 0, 0, 125),
             anchor="ra",
         )
 
@@ -501,30 +559,50 @@ def create_static_overlay(
             + line_spacing
         )
 
-    # اسم الموقع
+    # Website on a clean footer chip, using a real Latin font.
     site_bbox = draw.textbbox(
         (0, 0),
         SITE_TEXT,
         font=site_font,
     )
-
     site_width = site_bbox[2] - site_bbox[0]
+    site_height = site_bbox[3] - site_bbox[1]
+
+    footer_y = height - 82
+    footer_pad_x = 22
+    footer_pad_y = 10
+    footer_left = (
+        width - site_width - footer_pad_x * 2
+    ) // 2
+    footer_right = footer_left + site_width + footer_pad_x * 2
+
+    draw.rounded_rectangle(
+        (
+            footer_left,
+            footer_y - footer_pad_y,
+            footer_right,
+            footer_y + site_height + footer_pad_y,
+        ),
+        radius=18,
+        fill=(3, 13, 34, 205),
+        outline=(255, 255, 255, 24),
+        width=1,
+    )
 
     draw.text(
         (
-            (width - site_width) // 2,
-            height - 95,
+            footer_left + footer_pad_x,
+            footer_y,
         ),
         SITE_TEXT,
         font=site_font,
-        fill=(220, 225, 235, 235),
+        fill=(225, 231, 240, 245),
     )
 
-    canvas.save(
-        output_path,
+    overlay.save(
+        overlay_path,
         format="PNG",
     )
-
 
 def normalize_video(
     source: Path,
@@ -712,10 +790,12 @@ def render(
     with audio_path.open("wb") as file:
         shutil.copyfileobj(audio.file, file)
 
+    background_path = job_dir / "background.jpg"
     overlay_path = job_dir / "overlay.png"
 
-    create_static_overlay(
-        output_path=overlay_path,
+    create_layout_assets(
+        background_path=background_path,
+        overlay_path=overlay_path,
         headline=headline,
         category=category,
         date_text=date_text,
@@ -746,10 +826,10 @@ def render(
         seconds_per_image = audio_duration / len(image_paths)
         clip_paths: List[Path] = []
 
-        image_x = 60
-        image_y = 275
-        image_w = width - 120
-        image_h = 540
+        image_x = 0
+        image_y = 165
+        image_w = width
+        image_h = 1320
 
         for index, image_path in enumerate(image_paths, start=1):
             clip_path = job_dir / f"clip-{index:02d}.mp4"
@@ -763,7 +843,7 @@ def render(
                 "force_original_aspect_ratio=increase,"
                 f"crop={image_w}:{image_h},"
                 f"zoompan="
-                f"z='min(zoom+{zoom_step},1.045)':"
+                f"z='min(zoom+{zoom_step},1.035)':"
                 f"x='iw/2-(iw/zoom/2)':"
                 f"y='ih/2-(ih/zoom/2)':"
                 f"d={frames}:"
@@ -773,9 +853,16 @@ def render(
                 "[1:v]"
                 f"scale={width}:{height},"
                 "format=rgba"
-                "[layout];"
-                "[layout][photo]"
-                f"overlay={image_x}:{image_y}:shortest=1,"
+                "[background];"
+                "[2:v]"
+                f"scale={width}:{height},"
+                "format=rgba"
+                "[graphics];"
+                "[background][photo]"
+                f"overlay={image_x}:{image_y}:shortest=1"
+                "[base];"
+                "[base][graphics]"
+                "overlay=0:0:shortest=1,"
                 f"fps={fps},"
                 "format=yuv420p"
             )
@@ -788,6 +875,10 @@ def render(
                     "1",
                     "-i",
                     str(image_path),
+                    "-loop",
+                    "1",
+                    "-i",
+                    str(background_path),
                     "-loop",
                     "1",
                     "-i",
