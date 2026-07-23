@@ -272,24 +272,21 @@ def create_static_overlay(
         (0, 0, 0, 0),
     )
 
-    draw = ImageDraw.Draw(canvas)
+draw = ImageDraw.Draw(canvas)
 
-    regular_font_path = find_font(bold=False)
-    bold_font_path = find_font(bold=True)
+regular_font_path = find_font(bold=False)
+bold_font_path = find_font(bold=True)
 
-    date_font = load_font(regular_font_path, 38)
-    category_font = load_font(bold_font_path, 40)
-    headline_font = load_font(bold_font_path, 60)
-    site_font = ImageFont.truetype(
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        30,
-    )
+date_font = load_font(regular_font_path, 38)
+category_font = load_font(bold_font_path, 40)
+headline_font = load_font(bold_font_path, 60)
+site_font = load_font(regular_font_path, 30)
 
-    # خلفية موحدة وهوية بصرية
-    draw.rectangle(
-        (0, 0, width, height),
-        fill=(5, 18, 45, 255),
-    )
+# خلفية موحدة وهوية بصرية
+draw.rectangle(
+    (0, 0, width, height),
+    fill=(5, 18, 45, 255),
+)
 
     for y in range(height):
         progress = y / max(height - 1, 1)
