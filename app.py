@@ -25,7 +25,7 @@ TEMPLATE_PATH = Path(os.getenv("TEMPLATE_PATH", "/app/base_template.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 SITE_TEXT = "MarketPulseX365.com"
 TRANSITION_SECONDS = 0.35
 
@@ -384,6 +384,222 @@ def normalize_date_text(value: str) -> str:
     return raw
 
 
+
+def split_narration_chunks(
+    narration: str,
+    max_words: int = 9,
+    min_words: int = 4,
+) -> List[str]:
+    value = re.sub(
+        r"\s+",
+        " ",
+        str(narration or "").strip(),
+    )
+
+    if not value:
+        return []
+
+    sentence_parts = re.split(
+        r"(?<=[.!؟!؛])\s+|\n+",
+        value,
+    )
+
+    chunks: List[str] = []
+
+    for sentence in sentence_parts:
+        words = sentence.strip().split()
+
+        if not words:
+            continue
+
+        while len(words) > max_words:
+            chunks.append(" ".join(words[:max_words]))
+            words = words[max_words:]
+
+        if words:
+            current = " ".join(words)
+
+            if (
+                chunks
+                and len(words) < min_words
+                and (
+                    len(chunks[-1].split())
+                    + len(words)
+                    <= max_words + 2
+                )
+            ):
+                chunks[-1] = (
+                    chunks[-1].rstrip()
+                    + " "
+                    + current
+                )
+            else:
+                chunks.append(current)
+
+    return chunks
+
+
+def wrap_subtitle_text(text: str) -> str:
+    words = str(text or "").strip().split()
+
+    if len(words) <= 6:
+        return " ".join(words)
+
+    split_at = (len(words) + 1) // 2
+    first_line = " ".join(words[:split_at])
+    second_line = " ".join(words[split_at:])
+
+    return first_line + "\n" + second_line
+
+
+def escape_ass_text(text: str) -> str:
+    value = str(text or "")
+    value = value.replace("\\", r"\\")
+    value = value.replace("{", "(")
+    value = value.replace("}", ")")
+    value = value.replace("\r", " ")
+    value = value.replace("\n", r"\N")
+    return value
+
+
+def ass_timestamp(seconds: float) -> str:
+    total_centiseconds = max(
+        int(round(float(seconds) * 100)),
+        0,
+    )
+
+    hours = total_centiseconds // 360000
+    remainder = total_centiseconds % 360000
+    minutes = remainder // 6000
+    remainder %= 6000
+    secs = remainder // 100
+    centiseconds = remainder % 100
+
+    return (
+        f"{hours}:"
+        f"{minutes:02d}:"
+        f"{secs:02d}."
+        f"{centiseconds:02d}"
+    )
+
+
+def create_ass_subtitles(
+    output_path: Path,
+    narration: str,
+    duration: float,
+    width: int,
+    height: int,
+    image_bottom: int,
+) -> int:
+    chunks = split_narration_chunks(narration)
+
+    if not chunks:
+        output_path.write_text(
+            "",
+            encoding="utf-8",
+        )
+        return 0
+
+    total_words = sum(
+        max(len(chunk.split()), 1)
+        for chunk in chunks
+    )
+
+    scale = min(
+        width / 1080,
+        height / 1920,
+    )
+
+    font_size = max(
+        int(round(48 * scale)),
+        34,
+    )
+
+    margin_left = max(
+        int(round(92 * width / 1080)),
+        50,
+    )
+
+    margin_right = margin_left
+
+    # Places the changing subtitle inside the lower part of the news image.
+    subtitle_bottom = image_bottom - max(
+        int(round(72 * height / 1920)),
+        45,
+    )
+
+    margin_vertical = max(
+        height - subtitle_bottom,
+        20,
+    )
+
+    header = f"""[Script Info]
+Title: MarketPulseX365 synchronized narration
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: MPXSubtitle,Noto Sans Arabic,{font_size},&H00FFFFFF,&H00FFFFFF,&H00101822,&H78030B18,-1,0,0,0,100,100,0,0,3,10,0,2,{margin_left},{margin_right},{margin_vertical},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events: List[str] = []
+    elapsed_words = 0
+    safe_duration = max(float(duration), 0.1)
+
+    for index, chunk in enumerate(chunks):
+        chunk_words = max(len(chunk.split()), 1)
+        start_seconds = (
+            safe_duration
+            * elapsed_words
+            / total_words
+        )
+
+        elapsed_words += chunk_words
+
+        end_seconds = (
+            safe_duration
+            * elapsed_words
+            / total_words
+        )
+
+        if index == len(chunks) - 1:
+            end_seconds = safe_duration
+
+        subtitle_text = escape_ass_text(
+            wrap_subtitle_text(chunk)
+        )
+
+        events.append(
+            "Dialogue: 0,"
+            f"{ass_timestamp(start_seconds)},"
+            f"{ass_timestamp(end_seconds)},"
+            "MPXSubtitle,,0,0,0,,"
+            f"{subtitle_text}"
+        )
+
+    output_path.write_text(
+        header + "\n".join(events) + "\n",
+        encoding="utf-8",
+    )
+
+    return len(events)
+
+
+def escape_ffmpeg_filter_path(path: Path) -> str:
+    value = str(path)
+    value = value.replace("\\", r"\\")
+    value = value.replace(":", r"\:")
+    value = value.replace("'", r"\'")
+    return value
+
 def create_layout_assets(
     background_path: Path,
     overlay_path: Path,
@@ -534,13 +750,57 @@ def create_layout_assets(
         category_value
     )
 
-    category_center_x = sx(723)
-    category_center_y = sy(1149)
+    category_box_left = sx(500)
+    category_box_top = sy(1125)
+    category_box_right = sx(865)
+    category_box_bottom = sy(1187)
+
+    category_max_width = (
+        category_box_right
+        - category_box_left
+        - sx(34)
+    )
+
+    selected_category_font = None
+
+    for base_size in (
+        38,
+        36,
+        34,
+        32,
+        30,
+        28,
+    ):
+        candidate_font = load_font(
+            bold_font_path,
+            max(int(round(base_size * scale)), 24),
+        )
+
+        candidate_bbox = text_bbox(
+            draw=draw,
+            text=category_display,
+            font=candidate_font,
+        )
+
+        candidate_width = (
+            candidate_bbox[2]
+            - candidate_bbox[0]
+        )
+
+        if candidate_width <= category_max_width:
+            selected_category_font = candidate_font
+            break
+
+    if selected_category_font is None:
+        selected_category_font = load_font(
+            bold_font_path,
+            max(int(round(28 * scale)), 24),
+        )
 
     category_bbox = text_bbox(
         draw=draw,
         text=category_display,
-        font=category_font,
+        font=selected_category_font,
     )
 
     category_width = (
@@ -552,6 +812,16 @@ def create_layout_assets(
         - category_bbox[1]
     )
 
+    category_center_x = (
+        category_box_left
+        + category_box_right
+    ) // 2
+
+    category_center_y = (
+        category_box_top
+        + category_box_bottom
+    ) // 2
+
     draw_rtl_text(
         draw=draw,
         position=(
@@ -562,7 +832,7 @@ def create_layout_assets(
             - int(round(2 * scale)),
         ),
         text=category_display,
-        font=category_font,
+        font=selected_category_font,
         fill=(4, 20, 49, 255),
         anchor="ra",
     )
@@ -813,6 +1083,7 @@ def health() -> dict:
         "outro_exists": (ASSETS_DIR / "outro.mp4").exists(),
         "logo_exists": LOGO_PATH.exists(),
         "template_exists": TEMPLATE_PATH.exists(),
+        "subtitles_engine": "libass",
     }
 
 
@@ -878,6 +1149,7 @@ def render(
     headline = str(config.get("headline") or "").strip()
     category = str(config.get("category") or "الأخبار").strip()
     date_text = str(config.get("date") or "").strip()
+    narration = str(config.get("narration") or "").strip()
     width = int(config.get("width", 1080))
     height = int(config.get("height", 1920))
     fps = int(config.get("fps", 30))
@@ -929,6 +1201,7 @@ def render(
         audio_duration = probe_duration(audio_path)
         seconds_per_image = audio_duration / len(image_paths)
         clip_paths: List[Path] = []
+        subtitle_segments = 0
 
         image_x = int(round(43 * width / 941))
         image_y = int(round(458 * height / 1672))
@@ -1035,21 +1308,65 @@ def render(
         )
 
         middle = job_dir / "middle.mp4"
+        subtitles_path = job_dir / "subtitles.ass"
 
-        run(
+        subtitle_segments = create_ass_subtitles(
+            output_path=subtitles_path,
+            narration=narration,
+            duration=audio_duration,
+            width=width,
+            height=height,
+            image_bottom=image_y + image_h,
+        )
+
+        middle_command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(middle_silent),
+            "-i",
+            str(audio_path),
+        ]
+
+        if subtitle_segments > 0:
+            escaped_subtitles_path = (
+                escape_ffmpeg_filter_path(
+                    subtitles_path
+                )
+            )
+
+            subtitle_filter = (
+                "subtitles="
+                f"filename='{escaped_subtitles_path}':"
+                "fontsdir='/usr/share/fonts'"
+            )
+
+            middle_command.extend(
+                [
+                    "-vf",
+                    subtitle_filter,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                ]
+            )
+        else:
+            middle_command.extend(
+                [
+                    "-c:v",
+                    "copy",
+                ]
+            )
+
+        middle_command.extend(
             [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(middle_silent),
-                "-i",
-                str(audio_path),
                 "-map",
                 "0:v:0",
                 "-map",
                 "1:a:0",
-                "-c:v",
-                "copy",
                 "-c:a",
                 "aac",
                 "-ar",
@@ -1064,6 +1381,8 @@ def render(
                 str(middle),
             ]
         )
+
+        run(middle_command)
 
         intro = job_dir / "intro-normalized.mp4"
         middle_normalized = job_dir / "middle-normalized.mp4"
@@ -1158,6 +1477,8 @@ def render(
         "video_url": file_url,
         "file_name": final_path.name,
         "duration_seconds": probe_duration(final_path),
+        "subtitles_enabled": subtitle_segments > 0,
+        "subtitle_segments": subtitle_segments,
     }
 
 
