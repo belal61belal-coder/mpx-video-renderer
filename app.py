@@ -12,7 +12,7 @@ import httpx
 from bidi.algorithm import get_display
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from PIL import Image, ImageDraw, ImageFont, ImageOps, features
+from PIL import Image, ImageDraw, ImageFont, features
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -24,7 +24,9 @@ LOGO_PATH = Path(os.getenv("LOGO_PATH", "/app/logo.png"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
+SITE_TEXT = "MarketPulseX365.com"
+TRANSITION_SECONDS = 0.35
 
 app = FastAPI(
     title="MPX Video Renderer",
@@ -211,7 +213,7 @@ def wrap_rtl_text(
     font: ImageFont.FreeTypeFont,
     max_width: int,
     draw: ImageDraw.ImageDraw,
-    max_lines: int = 2,
+    max_lines: int = 3,
 ) -> List[str]:
     words = str(text or "").split()
 
@@ -256,33 +258,8 @@ def wrap_rtl_text(
     return lines[:max_lines]
 
 
-def rounded_image(
-    image: Image.Image,
-    size: tuple[int, int],
-    radius: int,
-) -> Image.Image:
-    fitted = ImageOps.fit(
-        image.convert("RGB"),
-        size,
-        method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.5),
-    ).convert("RGBA")
-
-    mask = Image.new("L", size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle(
-        (0, 0, size[0], size[1]),
-        radius=radius,
-        fill=255,
-    )
-
-    fitted.putalpha(mask)
-    return fitted
-
-
-def create_news_frame(
+def create_static_overlay(
     output_path: Path,
-    source_image_path: Path,
     headline: str,
     category: str,
     date_text: str,
@@ -292,31 +269,37 @@ def create_news_frame(
     canvas = Image.new(
         "RGBA",
         (width, height),
-        (5, 17, 42, 255),
+        (0, 0, 0, 0),
     )
 
     draw = ImageDraw.Draw(canvas)
 
-    # خلفية زرقاء داكنة خفيفة
-    for y in range(height):
-        progress = y / max(height - 1, 1)
-        r = int(5 + 4 * progress)
-        g = int(17 + 11 * progress)
-        b = int(42 + 25 * progress)
-
-        draw.line(
-            (0, y, width, y),
-            fill=(r, g, b, 255),
-        )
-
     regular_font_path = find_font(bold=False)
     bold_font_path = find_font(bold=True)
 
-    date_font = load_font(regular_font_path, 34)
-    category_font = load_font(bold_font_path, 38)
-    headline_font = load_font(bold_font_path, 58)
+    date_font = load_font(regular_font_path, 38)
+    category_font = load_font(bold_font_path, 40)
+    headline_font = load_font(bold_font_path, 60)
+    site_font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        30,
+    )
 
-    # خطوط الهوية
+    # خلفية موحدة وهوية بصرية
+    draw.rectangle(
+        (0, 0, width, height),
+        fill=(5, 18, 45, 255),
+    )
+
+    for y in range(height):
+        progress = y / max(height - 1, 1)
+        alpha = int(20 + 35 * progress)
+
+        draw.line(
+            (0, y, width, y),
+            fill=(7, 26, 62 + alpha // 5, 255),
+        )
+
     draw.rectangle(
         (0, 0, width, 8),
         fill=(230, 183, 40, 255),
@@ -326,19 +309,6 @@ def create_news_frame(
         (0, height - 8, width, height),
         fill=(230, 183, 40, 255),
     )
-
-    # اللوجو أكبر قليلًا
-    if LOGO_PATH.exists():
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        logo.thumbnail(
-            (245, 245),
-            Image.Resampling.LANCZOS,
-        )
-
-        canvas.alpha_composite(
-            logo,
-            (width - logo.width - 38, 24),
-        )
 
     # التاريخ
     date_value = str(date_text or "").strip()
@@ -353,83 +323,88 @@ def create_news_frame(
         date_width = date_bbox[2] - date_bbox[0]
         date_height = date_bbox[3] - date_bbox[1]
 
-        box_x = 48
-        box_y = 60
-        pad_x = 22
+        x = 48
+        y = 55
+        pad_x = 24
         pad_y = 14
 
         draw.rounded_rectangle(
             (
-                box_x,
-                box_y,
-                box_x + date_width + pad_x * 2,
-                box_y + date_height + pad_y * 2,
+                x,
+                y,
+                x + date_width + pad_x * 2,
+                y + date_height + pad_y * 2,
             ),
             radius=18,
             fill=(4, 19, 50, 225),
-            outline=(230, 183, 40, 180),
+            outline=(230, 183, 40, 190),
             width=2,
         )
 
         draw.text(
             (
-                box_x + pad_x,
-                box_y + pad_y - 3,
+                x + pad_x,
+                y + pad_y - 3,
             ),
             date_value,
             font=date_font,
             fill=(255, 255, 255, 255),
         )
 
-    # صورة الخبر كبيرة
-    image_box_x = 30
-    image_box_y = 220
-    image_box_w = width - 60
-    image_box_h = 1030
+    # اللوجو
+    if LOGO_PATH.exists():
+        logo = Image.open(LOGO_PATH).convert("RGBA")
+        logo.thumbnail(
+            (230, 230),
+            Image.Resampling.LANCZOS,
+        )
 
-    source_image = Image.open(source_image_path).convert("RGB")
-    article_image = rounded_image(
-        source_image,
-        (image_box_w, image_box_h),
-        radius=36,
-    )
+        canvas.alpha_composite(
+            logo,
+            (width - logo.width - 38, 22),
+        )
 
-    # ظل بسيط للصورة
-    shadow = Image.new(
-        "RGBA",
-        (image_box_w + 24, image_box_h + 24),
-        (0, 0, 0, 0),
-    )
-    shadow_draw = ImageDraw.Draw(shadow)
-    shadow_draw.rounded_rectangle(
-        (12, 12, image_box_w + 12, image_box_h + 12),
-        radius=40,
-        fill=(0, 0, 0, 95),
-    )
+    # إطار صورة الخبر 16:9
+    image_x = 60
+    image_y = 275
+    image_w = width - 120
+    image_h = 540
 
-    canvas.alpha_composite(
-        shadow,
-        (image_box_x - 12, image_box_y - 5),
-    )
-
-    canvas.alpha_composite(
-        article_image,
-        (image_box_x, image_box_y),
-    )
-
-    # فاصل ذهبي أسفل الصورة
     draw.rounded_rectangle(
         (
-            48,
-            image_box_y + image_box_h + 26,
-            width - 48,
-            image_box_y + image_box_h + 32,
+            image_x - 6,
+            image_y - 6,
+            image_x + image_w + 6,
+            image_y + image_h + 6,
+        ),
+        radius=26,
+        fill=(230, 183, 40, 255),
+    )
+
+    draw.rounded_rectangle(
+        (
+            image_x,
+            image_y,
+            image_x + image_w,
+            image_y + image_h,
+        ),
+        radius=22,
+        fill=(10, 26, 58, 255),
+    )
+
+    # فاصل
+    draw.rounded_rectangle(
+        (
+            60,
+            image_y + image_h + 55,
+            width - 60,
+            image_y + image_h + 61,
         ),
         radius=3,
         fill=(230, 183, 40, 220),
     )
 
-    # التصنيف أكبر وأوضح
+    # التصنيف
     category_raw = str(category or "الأخبار").strip()
     category_display = prepare_arabic(category_raw)
 
@@ -442,8 +417,8 @@ def create_news_frame(
     category_width = category_bbox[2] - category_bbox[0]
     category_height = category_bbox[3] - category_bbox[1]
 
-    category_right = width - 50
-    category_top = 1325
+    category_right = width - 60
+    category_top = 915
     category_pad_x = 30
     category_pad_y = 16
 
@@ -468,7 +443,7 @@ def create_news_frame(
         ),
         radius=28,
         fill=(13, 91, 190, 245),
-        outline=(91, 185, 255, 200),
+        outline=(91, 185, 255, 210),
         width=2,
     )
 
@@ -484,17 +459,17 @@ def create_news_frame(
         anchor="ra",
     )
 
-    # العنوان أعلى قليلًا وبخط أكبر
+    # العنوان
     headline_lines = wrap_rtl_text(
         text=headline,
         font=headline_font,
-        max_width=width - 100,
+        max_width=width - 120,
         draw=draw,
         max_lines=3,
     )
 
-    headline_y = category_bottom + 42
-    line_spacing = 18
+    headline_y = category_bottom + 45
+    line_spacing = 20
 
     for line in headline_lines:
         display_line = prepare_arabic(line)
@@ -502,14 +477,14 @@ def create_news_frame(
         draw_rtl_text(
             draw=draw,
             position=(
-                width - 50,
+                width - 60,
                 headline_y,
             ),
             text=display_line,
             font=headline_font,
             fill=(255, 255, 255, 255),
             stroke_width=2,
-            stroke_fill=(0, 0, 0, 140),
+            stroke_fill=(0, 0, 0, 150),
             anchor="ra",
         )
 
@@ -526,11 +501,28 @@ def create_news_frame(
             + line_spacing
         )
 
-    canvas.convert("RGB").save(
+    # اسم الموقع
+    site_bbox = draw.textbbox(
+        (0, 0),
+        SITE_TEXT,
+        font=site_font,
+    )
+
+    site_width = site_bbox[2] - site_bbox[0]
+
+    draw.text(
+        (
+            (width - site_width) // 2,
+            height - 95,
+        ),
+        SITE_TEXT,
+        font=site_font,
+        fill=(220, 225, 235, 235),
+    )
+
+    canvas.save(
         output_path,
-        format="JPEG",
-        quality=95,
-        optimize=True,
+        format="PNG",
     )
 
 
@@ -540,27 +532,64 @@ def normalize_video(
     width: int,
     height: int,
     fps: int,
+    fade_in: bool = False,
+    fade_out: bool = False,
 ) -> None:
-    run(
+    duration = probe_duration(source)
+    video_filters = [
+        (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase"
+        ),
+        f"crop={width}:{height}",
+        f"fps={fps}",
+        "format=yuv420p",
+    ]
+
+    audio_filters: List[str] = []
+
+    if fade_in:
+        video_filters.append(
+            f"fade=t=in:st=0:d={TRANSITION_SECONDS}"
+        )
+        audio_filters.append(
+            f"afade=t=in:st=0:d={TRANSITION_SECONDS}"
+        )
+
+    if fade_out and duration > TRANSITION_SECONDS:
+        fade_start = max(duration - TRANSITION_SECONDS, 0)
+        video_filters.append(
+            f"fade=t=out:st={fade_start:.3f}:d={TRANSITION_SECONDS}"
+        )
+        audio_filters.append(
+            f"afade=t=out:st={fade_start:.3f}:d={TRANSITION_SECONDS}"
+        )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        ",".join(video_filters),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+    ]
+
+    if audio_filters:
+        command.extend(
+            [
+                "-af",
+                ",".join(audio_filters),
+            ]
+        )
+
+    command.extend(
         [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source),
-            "-vf",
-            (
-                f"scale={width}:{height}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},"
-                f"fps={fps},"
-                "format=yuv420p"
-            ),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
             "-c:a",
             "aac",
             "-ar",
@@ -574,6 +603,8 @@ def normalize_video(
             str(target),
         ]
     )
+
+    run(command)
 
 
 def download_file(
@@ -681,6 +712,17 @@ def render(
     with audio_path.open("wb") as file:
         shutil.copyfileobj(audio.file, file)
 
+    overlay_path = job_dir / "overlay.png"
+
+    create_static_overlay(
+        output_path=overlay_path,
+        headline=headline,
+        category=category,
+        date_text=date_text,
+        width=width,
+        height=height,
+    )
+
     try:
         with httpx.Client(
             headers={
@@ -704,18 +746,38 @@ def render(
         seconds_per_image = audio_duration / len(image_paths)
         clip_paths: List[Path] = []
 
+        image_x = 60
+        image_y = 275
+        image_w = width - 120
+        image_h = 540
+
         for index, image_path in enumerate(image_paths, start=1):
-            frame_path = job_dir / f"frame-{index:02d}.jpg"
             clip_path = job_dir / f"clip-{index:02d}.mp4"
 
-            create_news_frame(
-                output_path=frame_path,
-                source_image_path=image_path,
-                headline=headline,
-                category=category,
-                date_text=date_text,
-                width=width,
-                height=height,
+            frames = max(int(seconds_per_image * fps), 1)
+            zoom_step = 0.0008
+
+            filter_complex = (
+                f"[0:v]"
+                f"scale={image_w}:{image_h}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={image_w}:{image_h},"
+                f"zoompan="
+                f"z='min(zoom+{zoom_step},1.045)':"
+                f"x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':"
+                f"d={frames}:"
+                f"s={image_w}x{image_h}:"
+                f"fps={fps}"
+                "[photo];"
+                "[1:v]"
+                f"scale={width}:{height},"
+                "format=rgba"
+                "[layout];"
+                "[layout][photo]"
+                f"overlay={image_x}:{image_y}:shortest=1,"
+                f"fps={fps},"
+                "format=yuv420p"
             )
 
             run(
@@ -724,14 +786,16 @@ def render(
                     "-y",
                     "-loop",
                     "1",
-                    "-framerate",
-                    str(fps),
                     "-i",
-                    str(frame_path),
+                    str(image_path),
+                    "-loop",
+                    "1",
+                    "-i",
+                    str(overlay_path),
+                    "-filter_complex",
+                    filter_complex,
                     "-t",
                     f"{seconds_per_image:.3f}",
-                    "-vf",
-                    "format=yuv420p",
                     "-an",
                     "-c:v",
                     "libx264",
@@ -810,9 +874,35 @@ def render(
         middle_normalized = job_dir / "middle-normalized.mp4"
         outro = job_dir / "outro-normalized.mp4"
 
-        normalize_video(intro_source, intro, width, height, fps)
-        normalize_video(middle, middle_normalized, width, height, fps)
-        normalize_video(outro_source, outro, width, height, fps)
+        normalize_video(
+            intro_source,
+            intro,
+            width,
+            height,
+            fps,
+            fade_in=False,
+            fade_out=True,
+        )
+
+        normalize_video(
+            middle,
+            middle_normalized,
+            width,
+            height,
+            fps,
+            fade_in=True,
+            fade_out=True,
+        )
+
+        normalize_video(
+            outro_source,
+            outro,
+            width,
+            height,
+            fps,
+            fade_in=True,
+            fade_out=False,
+        )
 
         concat_list = job_dir / "final.txt"
 
